@@ -1,0 +1,15 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+.clang_complete
+.gcc-flags.json
+
+# Secrets — never commit real WiFi / OTA credentials
+src/wifi_config.h
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*~
