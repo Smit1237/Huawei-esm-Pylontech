@@ -1,19 +1,19 @@
-# Huawei ESM → Pylontech (Deye) battery translator
+# Huawei ESM to Pylontech (Deye) battery translator
 
-Turn one or more **Huawei ESM** telecom lithium packs (ESM-48100B1, ESM-4875A1
-and relatives) into a battery your **Deye / SunSynk hybrid inverter** understands
-— no genuine Huawei controller (SMU/ECC) required.
+This firmware makes one or more **Huawei ESM** lithium packs work with a **Deye
+or SunSynk hybrid inverter**. You do not need a Huawei controller (SMU or ECC).
 
-An ESP32 reads each pack over RS485/Modbus (including Huawei's proprietary FC41
-unlock), **aggregates several packs into ONE virtual battery**, and presents it to
-the inverter as a **Pylontech RS485 BMS** ("Lithium mode 12"). Optional WiFi adds
-a web dashboard, MQTT (down to per-cell voltages), NTP, and over-the-air updates.
+An ESP32 reads each pack over RS485/Modbus. It uses the Huawei FC41 unlock
+sequence. It joins the packs into **one virtual battery**. It sends this battery
+to the inverter as a **Pylontech RS485 BMS** ("Lithium mode 12"). WiFi is
+optional. WiFi adds a web dashboard, MQTT (down to each cell voltage), NTP, and
+updates over the air.
 
 ```
   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐
-  │ ESM 214│   │ ESM 215│   │ ESM 216│   │ ESM 217│   4× Huawei ESM packs
+  │ ESM 214│   │ ESM 215│   │ ESM 216│   │ ESM 217│   4x Huawei ESM packs
   └───┬────┘   └───┬────┘   └───┬────┘   └───┬────┘   self-address over CAN
-      │  RS485 (Modbus, 9600 8N1) — one shared bus  │  (needs CAN terminator!)
+      │  RS485 (Modbus, 9600 8N1) — one shared bus  │  (CAN terminator required)
       └────────────┴──────┬──────┴────────────┘
                           │
                    ┌──────┴───────┐
@@ -22,7 +22,7 @@ a web dashboard, MQTT (down to per-cell voltages), NTP, and over-the-air updates
                    └──────┬───────┘
                           │  RS485 (Pylontech YDN1363, "Lithium mode 12")
                    ┌──────┴───────┐
-                   │  Deye / Sun- │  sees ONE battery: SOC, V, A, temps,
+                   │  Deye / Sun- │  reads ONE battery: SOC, V, A, temps,
                    │ Synk inverter│  cell min/max, charge/discharge limits
                    └──────────────┘
 ```
@@ -31,53 +31,57 @@ a web dashboard, MQTT (down to per-cell voltages), NTP, and over-the-air updates
 
 ## Features
 
-- **Multi-pack aggregation** — presents N packs as a single Pylontech battery
-  (voltage averaged, current/capacity/limits summed, SOC averaged, SOH the
-  worst pack, charge/discharge cut-offs from the highest/lowest cell across the
-  whole bank). Also runs great with a **single** pack.
-- **Real Huawei telemetry** — Modbus RTU + the FC41 unlock handshake
-  (FC03 `0x0106` → FC10 time-sync → FC41 access), so you get true SOC, per-cell
-  voltages, per-sensor temperatures, cycles, Ah and the packs' own limit
-  registers — not a guessed voltage curve.
-- **Fail-safe** — if every pack goes unreadable for 15 s the emulator goes
-  **silent**, so the inverter faults to a safe state instead of trusting stale
-  data. Charge-current limits are clamped so a bad read can never *inflate* them.
-- **Web dashboard** — live per-pack table, aggregate summary, and a JSON
-  `/status` endpoint for Home Assistant / scripting.
-- **MQTT** (optional) — one aggregate topic plus a fully-detailed topic per
-  pack, including every cell and every temperature sensor.
-- **NTP + timezone** — configurable servers and IANA zone names (`Europe/Moscow`
-  …), so timestamps are correct.
-- **OTA everywhere** — flash once over USB, then update wirelessly via
-  `espota`, a browser upload page, **or** the built-in Wi-Fi **setup AP** — no
-  more trips to the basement.
+- **Multi-pack aggregation.** The firmware shows N packs as one Pylontech
+  battery. It averages the voltage. It sums the current, the capacity, and the
+  limits. It averages the SOC. It uses the SOH of the worst pack. It sets the
+  charge and discharge cut-offs from the highest and lowest cell in the bank.
+  The firmware also works with one pack.
+- **Real Huawei telemetry.** The firmware uses Modbus RTU and the FC41 unlock
+  sequence (FC03 `0x0106`, then FC10 time sync, then FC41 access). You get the
+  true SOC, the cell voltages, the sensor temperatures, the cycles, the Ah, and
+  the pack limit registers.
+- **Fail-safe.** If all packs stay unreadable for 15 seconds, the emulator
+  becomes silent. Then the inverter goes to a safe state. It does not use old
+  data. The firmware clamps the charge-current limit. A bad read cannot increase
+  the limit.
+- **Web dashboard.** The dashboard shows a live per-pack table and an aggregate
+  summary. A JSON endpoint (`/status`) gives the data to Home Assistant or a
+  script.
+- **MQTT (optional).** The firmware sends one aggregate topic. It also sends one
+  topic for each pack. Each pack topic includes every cell and every temperature
+  sensor.
+- **NTP and timezone.** Set the servers and an IANA zone name (for example
+  `Europe/Moscow`). The timestamps are then correct.
+- **OTA (updates over the air).** Flash the firmware one time over USB. After
+  that, update it over WiFi. Use `espota`, the browser upload page, or the WiFi
+  setup access point.
 
 ---
 
-## ⚠️ The one thing everybody gets wrong: CAN-bus termination
+## Important: CAN-bus termination
 
-Multiple ESM packs **self-address** to `214, 215, 216, 217…` **only when the CAN
-bus between them is terminated.** The packs negotiate their addresses over the
-CAN pair; without the terminating resistor they all stay stuck at the default
-address **214** and collide on the shared RS485 bus (you'll see garbled,
-ever-changing frames).
+The packs self-address to `214, 215, 216, 217`, and higher. This works only when
+the CAN bus between the packs has termination. The packs set their addresses over
+the CAN pair. Without the terminating resistor, all packs stay at the default
+address **214**. Then they collide on the shared RS485 bus. You see garbled
+frames that change continuously.
 
-- Fit a **120 Ω resistor across CAN-H and CAN-L** at the **last pack's
-  `COM_OUT`** port. On the ESM RJ45 that is **pin 7 (CAN-H) ↔ pin 8 (CAN-L)**.
-- This terminator ships in the accessory bag with the batteries — it is part of
-  Huawei's designed system. **Keep it installed.**
-- Daisy-chain the packs' COM ports normally (`COM_OUT` → `COM_IN`), terminator
-  on the very last `COM_OUT`. Power-cycle the whole bank once with it in place
-  and let the addresses settle.
+- Install a **120 Ω resistor across CAN-H and CAN-L**. Install it at the
+  `COM_OUT` port of the **last pack**. On the ESM RJ45 connector this is
+  **pin 7 (CAN-H) and pin 8 (CAN-L)**.
+- The terminator comes in the accessory bag with the batteries. It is part of the
+  Huawei system. **Keep it installed.**
+- Connect the pack COM ports in a chain (`COM_OUT` to `COM_IN`). Install the
+  terminator on the last `COM_OUT`. Do a full power cycle of the bank. Let the
+  addresses settle.
 
-With the terminator in, a single ESP32 on one shared RS485 bus reads
-`214…217` cleanly. **No SMU, no ECC500, no maintenance tool.** (This overturns
-the common advice that a Huawei controller is mandatory — it is not; correct CAN
-termination alone is sufficient.)
+Result: one ESP32 on one shared RS485 bus reads `214` to `217` correctly. You do
+not need an SMU, an ECC500, or a maintenance tool. Correct CAN termination is
+sufficient.
 
-> RS485 termination (120 Ω across A/B) is a *different* resistor and is normally
-> unnecessary at 9600 baud over short indoor runs. Add it only if you have long
-> or electrically noisy cabling and see CRC errors.
+> RS485 termination (120 Ω across A and B) is a different resistor. You usually
+> do not need it at 9600 baud on short indoor cables. Add it only for long or
+> noisy cables that give CRC errors.
 
 ---
 
@@ -87,51 +91,52 @@ termination alone is sufficient.)
 
 | Qty | Item |
 |----:|------|
-| 1 | **ESP32** dev board — classic ESP32 (WROOM-32 / WROVER / DevKitC / NodeMCU-32S), or a **LilyGO T-Display** for an on-board screen |
-| **2** | **RS485 ↔ UART** modules, **auto-direction** type (no DE/RE pin) — e.g. HW-519, or a MAX485 board with automatic flow control. **You need two: one for the battery bus, one for the inverter bus.** |
-| 1 | 120 Ω CAN terminator (ships with the batteries — see above) |
-| — | Dupont wires; a common ground between the ESP32 and both RS485 modules |
+| 1 | **ESP32** board. Use a classic ESP32 (WROOM-32, WROVER, DevKitC, or NodeMCU-32S). Or use a **LilyGO T-Display** for a screen. |
+| **2** | **RS485-to-UART converters**, auto-direction type (no DE/RE pin). For example the HW-519, or a MAX485 board with automatic flow control. You need two converters. One is for the battery bus. One is for the inverter bus. |
+| 1 | 120 Ω CAN terminator (comes with the batteries — see above). |
+| — | Dupont wires. Use a common ground between the ESP32 and both converters. |
 
-A classic ESP32 is recommended because it has **three hardware UARTs** (console +
-two spare). The design needs two spare UARTs — one per RS485 bus. ESP32-S3 works
-too; ESP32-C3/C2/H2 do **not** (only ~2 usable UARTs).
+Use a classic ESP32. It has **three hardware UARTs** (one console and two spare).
+The design needs two spare UARTs, one for each RS485 bus. The ESP32-S3 also
+works. The ESP32-C3, C2, and H2 do not work. They have only about two usable
+UARTs.
 
-### RS485 modules & wiring
+### RS485 converters and wiring
 
-Use **auto-direction** modules — they switch TX/RX automatically, so you only
-wire power and the two data lines. Wiring is **straight-through** (the module's
-`TXD` pad goes to the ESP32's **TX** pin, `RXD` to the ESP32's **RX** pin — *not*
-crossed):
+Use **auto-direction** converters. They switch between transmit and receive
+automatically. You wire only the power and the two data lines. The wiring is
+**straight-through**. Connect the converter `TXD` pad to the ESP32 **TX** pin.
+Connect the converter `RXD` pad to the ESP32 **RX** pin. Do not cross them.
 
-| RS485 module pad | Connect to |
-|------------------|------------|
-| `VCC`            | ESP32 **5V** (these modules want 5 V; logic is 3.3 V-safe) |
-| `GND`            | ESP32 **GND** (common ground is essential) |
-| `TXD`            | ESP32 **TX** GPIO |
-| `RXD`            | ESP32 **RX** GPIO |
-| `A` / `B`        | RS485 `A`/`B` on the pack (or inverter) — A→A, B→B |
+| Converter pad | Connect to |
+|---------------|------------|
+| `VCC`         | ESP32 **5V**. The converters need 5 V. The logic is 3.3 V safe. |
+| `GND`         | ESP32 **GND**. A common ground is necessary. |
+| `TXD`         | ESP32 **TX** GPIO |
+| `RXD`         | ESP32 **RX** GPIO |
+| `A` / `B`     | RS485 `A`/`B` on the pack or the inverter. Connect A to A and B to B. |
 
-### You need TWO RS485 converters — one per bus
+### You need two RS485 converters — one for each bus
 
-The ESP32 sits between two separate RS485 buses, so it needs **two** converters,
-each on its own UART:
+The ESP32 is between two separate RS485 buses. It needs **two** converters. Each
+converter uses its own UART.
 
-- **Converter A → the batteries** (ESM COM port) — UART1
-- **Converter B → the inverter** (Deye BMS port) — UART2
+- **Converter A goes to the batteries** (ESM COM port). It uses UART1.
+- **Converter B goes to the inverter** (Deye BMS port). It uses UART2.
 
-They never share pins. Each converter needs 4 wires: `VCC`(5V), `GND`, `TXD`,
-`RXD`. Wiring is **straight-through**: module `TXD` → ESP32 **TX** GPIO, module
-`RXD` → ESP32 **RX** GPIO (not crossed). All grounds must be common.
+The converters do not share pins. Each converter needs four wires: `VCC` (5V),
+`GND`, `TXD`, and `RXD`. Connect `TXD` to the ESP32 **TX** GPIO. Connect `RXD` to
+the ESP32 **RX** GPIO. Do not cross them. All grounds must be common.
 
-### Per-board pin map
+### Pin map for each board
 
-The firmware default pins are **GPIO33/32** (ESM) and **GPIO26/25** (Deye).
-These land in convenient places on the common boards:
+The default firmware pins are **GPIO33 and GPIO32** (ESM), and **GPIO26 and
+GPIO25** (Deye). These pins are in good positions on the common boards.
 
-**Generic ESP32 DevKit (WROOM-32 / WROVER / NodeMCU-32S / DevKitC)**
+**Generic ESP32 DevKit (WROOM-32, WROVER, NodeMCU-32S, DevKitC)**
 
-| Converter | module pad | ESP32 pin |
-|-----------|-----------|-----------|
+| Converter | Converter pad | ESP32 pin |
+|-----------|---------------|-----------|
 | A — ESM (battery) | `TXD` | **GPIO33** |
 | A — ESM (battery) | `RXD` | **GPIO32** |
 | A — ESM (battery) | `VCC` / `GND` | 5V / GND |
@@ -139,55 +144,59 @@ These land in convenient places on the common boards:
 | B — Deye (inverter) | `RXD` | **GPIO25** |
 | B — Deye (inverter) | `VCC` / `GND` | 5V / GND |
 
-GPIO 32/33/25/26 are free, non-strapping and output-capable on WROOM-32 and
-WROVER (the WROVER's PSRAM uses 16/17, which are deliberately avoided).
+GPIO 32, 33, 25, and 26 are free, non-strapping, and output-capable on the
+WROOM-32 and the WROVER. The WROVER PSRAM uses GPIO 16 and 17, so the design
+avoids them.
 
 **LilyGO T-Display v1.1**
 
-Same GPIOs — and conveniently, **GPIO 32, 33, 25, 26 plus 5V and GND are all on
-the right-hand header**, so both converters land on one contiguous run. The TFT
-uses 4/5/16/18/19/23 internally (not broken out), so there is no clash.
+The GPIOs are the same. GPIO 32, 33, 25, 26, plus 5V and GND are all on the
+right header. Both converters connect to one continuous row. The TFT uses GPIO 4,
+5, 16, 18, 19, and 23 internally. These pins are not on the header, so there is
+no conflict.
 
-| Converter | module pad | header pin |
-|-----------|-----------|-----------|
+| Converter | Converter pad | Header pin |
+|-----------|---------------|-----------|
 | A — ESM | `TXD` / `RXD` | **GPIO33** / **GPIO32** |
 | B — Deye | `TXD` / `RXD` | **GPIO26** / **GPIO25** |
 | both | `VCC` / `GND` | 5V / GND (right header) |
 
-**ESP32-S3 (e.g. DevKitC-1)** — has enough UARTs, but different GPIOs. Pick four
-free pins (avoid the USB, strapping, PSRAM and flash pins; GPIO 4/5/6/7 are a
-safe set on most S3 boards) and set them at build time:
+**ESP32-S3 (for example the DevKitC-1)** has enough UARTs, but the GPIOs are
+different. Choose four free pins. Avoid the USB, strapping, PSRAM, and flash
+pins. GPIO 4, 5, 6, and 7 are a safe set on most S3 boards. Set them at build
+time:
 
 ```ini
 build_flags = -DESM_TX_PIN=4 -DESM_RX_PIN=5 -DDEYE_TX_PIN=6 -DDEYE_RX_PIN=7
 ```
 
-Any pin can be remapped on any board with the
-`-DESM_TX_PIN=` / `-DESM_RX_PIN=` / `-DDEYE_TX_PIN=` / `-DDEYE_RX_PIN=` flags.
+You can remap any pin on any board. Use the `-DESM_TX_PIN=`, `-DESM_RX_PIN=`,
+`-DDEYE_TX_PIN=`, and `-DDEYE_RX_PIN=` flags.
 
-On the **inverter** side, connect converter B's `A`/`B` to the Deye's **BMS/CAN
-RS485 port** (the port used for lithium comms) and set the inverter to **Lithium
-mode 12** (see below).
+On the inverter side, connect the `A` and `B` wires of converter B to the Deye
+**BMS/CAN RS485 port**. This is the port for lithium communication. Set the
+inverter to **Lithium mode 12** (see below).
 
-### ESM COM-port (RJ45) reference
+### ESM COM port (RJ45) reference
 
 | Pin | Signal |
 |----:|--------|
-| 7   | CAN-H  ← 120 Ω terminator here … |
-| 8   | CAN-L  ← … to here, on the last pack |
-| —   | RS485 A / B for Modbus telemetry (this is what the ESP32 reads) |
+| 7   | CAN-H  — install the 120 Ω terminator here … |
+| 8   | CAN-L  — … to here, on the last pack |
+| —   | RS485 A / B for Modbus telemetry. The ESP32 reads this pair. |
 
-The exact RS485 A/B pins vary slightly by model — **check your pack's manual or
-silkscreen** and connect A→A, B→B. The CAN terminator pins (7/8) are consistent
-across the ESM family.
+The exact RS485 A and B pins change with the model. Check the pack manual or the
+silkscreen. Connect A to A and B to B. The CAN terminator pins (7 and 8) are the
+same for all ESM packs.
 
 ---
 
-## Build & flash
+## Build and flash
 
 ### 1. Install PlatformIO
 
-Use the [PlatformIO IDE](https://platformio.org/) (VS Code extension) or the CLI:
+Use the [PlatformIO IDE](https://platformio.org/) (VS Code extension) or the
+command line:
 
 ```bash
 pip install platformio
@@ -195,75 +204,82 @@ pip install platformio
 
 ### 2. Set your WiFi (optional)
 
-WiFi is **optional** — the RS485 translation runs without it. WiFi adds the
-WebUI, MQTT and OTA. Three ways to configure it, in order of precedence:
+WiFi is optional. The RS485 translation works without WiFi. WiFi adds the web UI,
+MQTT, and OTA. There are three ways to set the WiFi. This is the order of
+precedence:
 
-1. **Setup AP (easiest, no rebuild).** Flash the firmware as-is; if it can't
-   join a network it hosts an access point **`ESM-Bank-Setup`** (password
-   `esmbank-setup`). Join it from a phone, the config page pops up (captive
-   portal), enter your WiFi, Save — the device reboots and joins your network.
-2. **Compile it in.** Copy `src/wifi_config.example.h` → `src/wifi_config.h`
-   (git-ignored) and fill in `WIFI_SSID` / `WIFI_PASS` / `OTA_PASS`.
-3. **Build flags.** Pass `-DWIFI_SSID='"…"' -DWIFI_PASS='"…"'`.
+1. **Setup access point (easiest, no rebuild).** Flash the firmware. If it cannot
+   join a network, it makes an access point (**`ESM-Bank-Setup`**, password
+   `esmbank-setup`). Join it with a phone. The configuration page opens
+   automatically (captive portal). Enter your WiFi and press Save. The device
+   restarts and joins your network.
+2. **Compile the credentials.** Copy `src/wifi_config.example.h` to
+   `src/wifi_config.h` (git-ignored). Set `WIFI_SSID`, `WIFI_PASS`, and
+   `OTA_PASS`.
+3. **Build flags.** Pass `-DWIFI_SSID='"…"'` and `-DWIFI_PASS='"…"'`.
 
-### 3. Pick your board & build
+### 3. Select the board and build
 
 | PlatformIO env | Board | Screen |
 |----------------|-------|--------|
 | `bank_esp32` | generic ESP32 (WROOM/WROVER/…) | no |
 | `bank_tdisplay` | LilyGO T-Display v1.1 | yes |
-| `translator_esp32` | generic ESP32 — single-pack, no WiFi | no |
-| `translator_tdisplay` | LilyGO T-Display — single-pack | yes |
+| `translator_esp32` | generic ESP32 — single pack, no WiFi | no |
+| `translator_tdisplay` | LilyGO T-Display — single pack | yes |
 
 ```bash
-pio run -e bank_esp32                 # build
+pio run -e bank_esp32                 # build the firmware
 pio run -e bank_esp32 -t upload       # flash over USB
-pio device monitor                    # watch the serial log
+pio device monitor                    # read the serial log
 ```
 
 ### 4. Update over the air (after the first USB flash)
 
-Three options, all wireless:
+Use one of three wireless methods:
 
-- **espota** (CLI): `pio run -e bank_esp32_ota -t upload`
-  (uses mDNS `esm-bank.local`; set `upload_port` to the device IP if mDNS is
-  flaky; `--auth` must match `OTA_PASS`).
-- **Browser**: open `http://<device-ip>/`, *Firmware → Choose file → Upload*.
-- **Setup AP**: same browser upload while joined to `ESM-Bank-Setup`.
+- **espota** (command line): `pio run -e bank_esp32_ota -t upload`. It uses the
+  mDNS name `esm-bank.local`. Set `upload_port` to the device IP if mDNS fails.
+  The `--auth` value must match `OTA_PASS`.
+- **Browser:** open `http://<device-ip>/`. Select Firmware, then Choose file,
+  then Upload.
+- **Setup access point:** use the same browser upload after you join
+  `ESM-Bank-Setup`.
 
 ---
 
-## Configuration & the web dashboard
+## Configuration and the web dashboard
 
-Browse to `http://<device-ip>/` (or `http://esm-bank.local/`):
+Open `http://<device-ip>/` (or `http://esm-bank.local/`):
 
-- **Live view** — aggregate SOC / V / A and a per-pack table with serials.
-- **WiFi** — change network (reboots to reconnect).
-- **MQTT** — enable, broker host/port, user/pass, topic prefix, publish
-  interval, and a "publish each pack separately" toggle. Off by default.
-- **Time (NTP)** — up to 3 servers + a timezone (IANA name like
-  `Europe/Berlin`, autocomplete, or a raw POSIX string). Applied live.
-- **Firmware** — browser OTA upload.
+- **Live view.** It shows the aggregate SOC, V, and A, and a per-pack table with
+  the serial numbers.
+- **WiFi.** Change the network. The device restarts to reconnect.
+- **MQTT.** Enable it. Set the broker host and port, the user and password, the
+  topic prefix, and the publish interval. There is a "publish each pack
+  separately" option. MQTT is off by default.
+- **Time (NTP).** Set up to three servers and a timezone. Use an IANA name (for
+  example `Europe/Berlin`) or a raw POSIX string. The change is applied live.
+- **Firmware.** Upload new firmware from the browser.
 
-`GET /status` returns everything as JSON (aggregate, Deye poll counters, network
-state, and every pack's registers incl. all cells/temps and fault words) — handy
-for Home Assistant or `curl`.
+`GET /status` returns all data as JSON. It includes the aggregate, the Deye poll
+counters, the network state, and every pack register (all cells, all
+temperatures, and the fault words). Use it with Home Assistant or `curl`.
 
 ---
 
 ## MQTT
 
-When enabled, every `interval` seconds the device publishes (default prefix
-`esmbank`):
+When MQTT is on, the firmware publishes every `interval` seconds. The default
+topic prefix is `esmbank`.
 
-**`esmbank/bank`** — the virtual battery the inverter sees:
+**`esmbank/bank`** — the virtual battery that the inverter reads:
 
 ```json
 {"soc":100,"v":51.64,"i":0.00,"soh":95,"tmin":18,"tmax":22,
  "cycles":92,"ccl":325.9,"dcl":346.8,"packs":4,"ts":1786669362}
 ```
 
-**`esmbank/pack/<addr>`** — one message per pack, everything it reports:
+**`esmbank/pack/<addr>`** — one message for each pack, with all its data:
 
 ```json
 {"addr":214,"sn":"EX19B0004574","soc":100,"v":51.11,"busv":53.69,"i":0.00,
@@ -275,23 +291,25 @@ When enabled, every `interval` seconds the device publishes (default prefix
  "temps":[21,21,21,20,20,20,20,21,21,21,21,22,22,22,22],"ts":1786669362}
 ```
 
-Fields: `v` = pack terminal volts, `busv` = shared DC-bus volts, cell values in
-**mV**, temps in **°C**, `ah` = lifetime throughput, `ccl/dcl/cvl/dvl` =
-charge/discharge current & voltage limits, `*coef` = the pack's own derate %,
-and `sysf/cellf/prot/warn/spec` = the fault/warning/protection bit-words
-(0 = healthy). `ts` is UTC epoch seconds (0 until NTP has synced).
+Fields: `v` is the pack terminal voltage. `busv` is the shared DC-bus voltage.
+The cell values are in **mV**. The temperatures are in **°C**. `ah` is the
+lifetime throughput. `ccl`, `dcl`, `cvl`, and `dvl` are the charge and discharge
+current and voltage limits. The `*coef` values are the pack derate percentage.
+`sysf`, `cellf`, `prot`, `warn`, and `spec` are the fault, warning, and
+protection words (`0` means healthy). `ts` is the UTC time in epoch seconds
+(`0` until NTP syncs).
 
 ---
 
 ## Deye / SunSynk inverter setup
 
-1. Battery type: **Lithium**.
-2. BMS protocol: **Mode 12** (= Pylontech RS485). (Mode 00 is Pylontech CAN —
-   not what this firmware speaks.)
-3. Wire the Deye-side RS485 module to the inverter's BMS RS485 port.
+1. Set the battery type to **Lithium**.
+2. Set the BMS protocol to **Mode 12** (Pylontech RS485). Mode 00 is Pylontech
+   CAN. This firmware does not use Mode 00.
+3. Connect the Deye-side RS485 converter to the inverter BMS RS485 port.
 
-The emulator answers as Pylontech address `0x02` (`-DDEYE_ADDR=` to change) to
-the inverter's `CID1=0x46`, `CID2=0x61/62/63` polls.
+The emulator answers as Pylontech address `0x02`. Change it with `-DDEYE_ADDR=`.
+The inverter sends `CID1=0x46` and `CID2=0x61/62/63` polls.
 
 ---
 
@@ -299,45 +317,45 @@ the inverter's `CID1=0x46`, `CID2=0x61/62/63` polls.
 
 | Quantity | Rule |
 |----------|------|
-| Voltage | average (packs are paralleled) |
+| Voltage | average (the packs are in parallel) |
 | Current | sum |
-| SOC | average (equal-capacity packs) |
-| SOH | minimum (worst pack) |
-| Charge cut-off cell | highest cell across the bank |
-| Discharge cut-off cell | lowest cell across the bank |
-| Temps | min / max across all sensors |
-| CCL / DCL | sum of each pack's **effective** limit (its own coefficient folded in, clamped ≤ 100 %) |
+| SOC | average (the packs have equal capacity) |
+| SOH | minimum (the worst pack) |
+| Charge cut-off cell | the highest cell in the bank |
+| Discharge cut-off cell | the lowest cell in the bank |
+| Temperatures | minimum and maximum of all sensors |
+| CCL / DCL | sum of each pack effective limit (the firmware applies the coefficient and clamps it to 100 % maximum) |
 | CVL / DVL | most conservative (lowest CVL, highest DVL) |
 | Faults | logical OR |
 
-A pack that hasn't been read for 15 s drops out of the aggregate; if none remain,
-the emulator stops answering the inverter.
+A pack that stays unread for 15 seconds leaves the aggregate. If no pack remains,
+the emulator stops the answers to the inverter.
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Cause / fix |
-|---------|-------------|
-| Only address 214 answers, frames are garbled and keep changing | Missing/!bad **CAN terminator** — the packs are colliding at 214. Fit the 120 Ω across pins 7/8 on the last pack, power-cycle the bank. |
-| Nothing at all on the ESM bus (`tx` climbs, `rx` stays 0) | RS485 A/B swapped, no common ground, or wrong pins. Try swapping A/B. |
-| A pack reads but SOC/limits are 0 | It answered telemetry but not its limit block yet — it fills in within a few poll cycles. |
-| Inverter shows "battery not connected" | Deye not in Lithium **Mode 12**, RS485 A/B swapped on the inverter side, or the emulator is silent because no pack is readable. |
-| espota "No response from device" | The device is busy or mid-reboot; retry. If it just crashed, USB-flash a good build once, then OTA works again. |
+| Symptom | Cause and fix |
+|---------|---------------|
+| Only address 214 answers. The frames are garbled and change. | The CAN terminator is missing or bad. The packs collide at 214. Install the 120 Ω resistor across pins 7 and 8 on the last pack. Do a power cycle. |
+| No data on the ESM bus (`tx` increases, `rx` stays 0). | The RS485 A and B are swapped, the ground is not common, or the pins are wrong. Swap A and B. |
+| A pack reads, but the SOC and limits are 0. | The pack answered the telemetry but not the limit block. The values fill in after a few poll cycles. |
+| The inverter shows "battery not connected". | The Deye is not in Lithium Mode 12, the RS485 A and B are swapped on the inverter side, or the emulator is silent because no pack is readable. |
+| espota shows "No response from device". | The device is busy or it restarts. Try again. If it crashed, flash a good build over USB one time. Then OTA works again. |
 
 ---
 
-## Protocol references & credits
+## Protocol references and credits
 
-- Huawei ESM Modbus + FC41 handshake reverse-engineering:
-  [williamsioSapo/Huawei_Battery_monitor](https://github.com/williamsioSapo/Huawei_Battery_monitor)
-- Pylontech YDN1363 / Deye RS485 emulation modelled on
+- Huawei ESM Modbus and FC41 handshake research:
+  [williamsioSapo/Huawei_Battery_monitor](https://github.com/williamsioSapo/Huawei_Battery_monitor).
+- Pylontech YDN1363 and Deye RS485 emulation, based on
   [Fahmula/esphome-pylontech-rs485](https://github.com/Fahmula/esphome-pylontech-rs485).
 
-Built and tested against a bank of 4× ESM-48100B1 (100 Ah) and a Deye
-SUN-*K-SG05LP1.
+The firmware was built and tested with a bank of 4 ESM-48100B1 packs (100 Ah)
+and a Deye SUN-*K-SG05LP1 inverter.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Provided as-is; you are working with live mains
-inverters and lithium batteries at your own risk.
+MIT. See [LICENSE](LICENSE). The firmware is provided as-is. You work with live
+mains inverters and lithium batteries at your own risk.
