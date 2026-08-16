@@ -1,16 +1,16 @@
-// ESM battery BANK -> Deye translator, with WiFi / WebUI / MQTT / OTA.
+// ESM battery bank to Deye translator. It adds WiFi, WebUI, MQTT, and OTA.
 //
-// The four Huawei ESM packs self-address to 214..217 on ONE shared RS485 bus
-// (this works once the Huawei CAN matching-resistor is installed on the last
-// pack's COM_OUT). This firmware:
-//   * polls each pack (wake + FC41 auth per address, then FC03 reads),
-//   * aggregates them into ONE virtual battery,
-//   * emits Pylontech RS485 (Deye "Lithium mode 12") on a second bus,
-//   * serves a web UI to configure optional MQTT (aggregate + per-pack),
-//   * supports OTA (ArduinoOTA via espota, AND browser upload) so it never
-//     needs a USB cable again.
+// The four Huawei ESM packs self-address to 214..217 on ONE shared RS485 bus.
+// This works after you install the Huawei CAN matching resistor on the
+// COM_OUT of the last pack. This firmware does these tasks:
+//   * It polls each pack: wake and FC41 auth per address, then FC03 reads.
+//   * It aggregates the packs into ONE virtual battery.
+//   * It sends Pylontech RS485 (Deye "Lithium mode 12") on a second bus.
+//   * It serves a web UI to set optional MQTT (aggregate and per-pack).
+//   * It supports OTA (ArduinoOTA through espota, AND browser upload), so it
+//     does not need a USB cable again.
 //
-// Hardware (unchanged from the translator):
+// Hardware (same as the translator):
 //   ESM  bus: Serial1  GPIO33 TX -> module TXD, GPIO32 RX <- module RXD
 //   Deye bus: Serial2  GPIO26 TX -> module TXD, GPIO25 RX <- module RXD
 //   (straight-through auto-direction RS485 modules, VCC 5V, common GND)
@@ -30,10 +30,10 @@
 #include "display.h"
 #endif
 
-// WiFi is OPTIONAL — the RS485 translation to the Deye works without it. WiFi
-// only enables the WebUI, OTA and MQTT. Set your credentials by copying
-// src/wifi_config.example.h to src/wifi_config.h (git-ignored) and editing it,
-// or by passing -DWIFI_SSID=... -DWIFI_PASS=... build flags.
+// WiFi is OPTIONAL. The RS485 translation to the Deye works without WiFi. WiFi
+// only enables the WebUI, OTA, and MQTT. To set your credentials, copy
+// src/wifi_config.example.h to src/wifi_config.h (git-ignored) and edit it.
+// As an alternative, pass -DWIFI_SSID=... -DWIFI_PASS=... build flags.
 #if defined(__has_include)
 #  if __has_include("wifi_config.h")
 #    include "wifi_config.h"
@@ -48,16 +48,16 @@
 #ifndef OTA_PASS
 #define OTA_PASS "esmbank-ota"
 #endif
-// Fallback setup access point: if no working WiFi is configured, the device
-// hosts this AP so you can join it and enter your network on the config page.
+// Fallback setup access point: if no WiFi is configured or works, the device
+// hosts this AP. Join the AP and enter your network on the config page.
 #ifndef AP_SSID
 #define AP_SSID "ESM-Bank-Setup"
 #endif
 #ifndef AP_PASS
-#define AP_PASS "esmbank-setup"   // >= 8 chars (WPA2); the setup-AP password
+#define AP_PASS "esmbank-setup"   // The setup AP password. WPA2 needs 8 characters minimum.
 #endif
-// Bump this on every build so you can confirm — in the WebUI header and the
-// serial banner — exactly which image is live (proves an OTA push actually took).
+// Increase this on each build. Then you can confirm the live image in the
+// WebUI header and the serial banner. This proves that an OTA push worked.
 #ifndef FW_VERSION
 #define FW_VERSION "bank-1.7"
 #endif
@@ -79,7 +79,7 @@
 
 static const uint8_t PACK_ADDR[] = { 214, 215, 216, 217 };
 #define NUM_PACKS (sizeof(PACK_ADDR) / sizeof(PACK_ADDR[0]))
-#define STALE_MS  15000       // pack unreadable this long -> drop from bank
+#define STALE_MS  15000       // If a pack stays unreadable this long, drop it from the bank.
 
 HuaweiESM  esm(Serial1, ESM_RX_PIN, ESM_TX_PIN);
 PylontechEmu deye(Serial2, DEYE_ADDR);
@@ -89,14 +89,14 @@ struct Pack {
     bool     authed = false;
     uint8_t  fails = 0;
     char     serial[24] = "";
-    PackSnapshot s;           // s.valid = fresh data; s.ts = last read
+    PackSnapshot s;           // s.valid = fresh data. s.ts = time of last read.
 };
 static Pack pk[NUM_PACKS];
-static PackSnapshot agg;                 // aggregate handed to the Deye emu
-static SemaphoreHandle_t mux;            // guards pk[] + agg
-static TaskHandle_t esmH = nullptr, deyeH = nullptr;  // suspended during web OTA
+static PackSnapshot agg;                 // aggregate given to the Deye emulator
+static SemaphoreHandle_t mux;            // guards pk[] and agg
+static TaskHandle_t esmH = nullptr, deyeH = nullptr;  // suspended during a web OTA
 
-// ---------------- config (persisted) ----------------
+// ---------------- config (saved) ----------------
 struct Config {
     bool     mqttEnable = false;
     char     host[64] = "";
@@ -105,14 +105,14 @@ struct Config {
     char     pass[64] = "";
     char     topic[32] = "esmbank";
     bool     perPack = true;
-    uint16_t interval = 5;               // publish period, seconds
-    // time: up to 3 NTP servers (only ntp1 needed) + POSIX TZ string
+    uint16_t interval = 5;               // publish period in seconds
+    // time: up to 3 NTP servers (ntp1 is enough) and a POSIX TZ string
     char     ntp1[48] = "pool.ntp.org";
     char     ntp2[48] = "";
     char     ntp3[48] = "";
-    char     tz[40]   = "Europe/Moscow"; // IANA name or raw POSIX (offset sign is INVERTED)
-    // WiFi credentials set at runtime (setup AP / WebUI). Empty -> fall back to
-    // the compile-time WIFI_SSID/WIFI_PASS, and if those are unset, the setup AP.
+    char     tz[40]   = "Europe/Moscow"; // IANA name or raw POSIX (the offset sign is INVERTED)
+    // WiFi credentials set at runtime (setup AP or WebUI). If empty, use the
+    // compile-time WIFI_SSID/WIFI_PASS. If those are unset, use the setup AP.
     char     wifiSsid[33] = "";
     char     wifiPass[65] = "";
 };
@@ -159,14 +159,15 @@ static void saveCfg() {
     prefs.end();
 }
 
-// Readable IANA zone names -> POSIX TZ strings (the ESP has no tzdata db, so we
-// carry a curated map). Anything not listed is passed through verbatim, so a raw
-// POSIX string like "<+03>-3" still works. DST-observing entries use current
-// rules; fixed-offset zones never drift. Heavy on Europe/Russia (Smit's region).
+// Readable IANA zone names -> POSIX TZ strings. The ESP32 has no tzdata
+// database, so the code carries this map. It passes any unlisted name through
+// unchanged, so a raw POSIX string like "<+03>-3" still works. DST zones use
+// current rules. Fixed-offset zones do not drift. The map favors Europe and
+// Russia (Smit's region).
 struct TzEntry { const char *name; const char *posix; };
 static const TzEntry TZ_TABLE[] = {
     { "UTC",                 "UTC0" },
-    // --- Europe / Atlantic (EU DST last-Sun-Mar..last-Sun-Oct unless noted) ---
+    // --- Europe / Atlantic (EU DST: last Sun Mar to last Sun Oct, unless noted) ---
     { "Europe/London",       "GMT0BST,M3.5.0/1,M10.5.0" },
     { "Europe/Dublin",       "GMT0BST,M3.5.0/1,M10.5.0" },
     { "Europe/Lisbon",       "WET0WEST,M3.5.0/1,M10.5.0" },
@@ -202,7 +203,7 @@ static const TzEntry TZ_TABLE[] = {
     { "Europe/Istanbul",     "<+03>-3" },
     { "Europe/Moscow",       "<+03>-3" },
     { "Europe/Samara",       "<+04>-4" },
-    // --- Russia (east) / Central Asia (fixed, no DST) ---
+    // --- Russia (east) / Central Asia (fixed offset, no DST) ---
     { "Asia/Yekaterinburg",  "<+05>-5" },
     { "Asia/Omsk",           "<+06>-6" },
     { "Asia/Novosibirsk",    "<+07>-7" },
@@ -242,7 +243,7 @@ static const TzEntry TZ_TABLE[] = {
     { "Asia/Manila",         "PST-8" },
     { "Asia/Tokyo",          "JST-9" },
     { "Asia/Seoul",          "KST-9" },
-    // --- Oceania (southern-hemisphere DST Oct..Apr) ---
+    // --- Oceania (southern hemisphere DST: Oct to Apr) ---
     { "Australia/Perth",     "AWST-8" },
     { "Australia/Darwin",    "ACST-9:30" },
     { "Australia/Adelaide",  "ACST-9:30ACDT,M10.1.0,M4.1.0/3" },
@@ -253,7 +254,7 @@ static const TzEntry TZ_TABLE[] = {
     { "Pacific/Fiji",        "<+12>-12" },
     { "Pacific/Guam",        "ChST-10" },
     { "Pacific/Honolulu",    "HST10" },
-    // --- North America (US/CA DST 2nd-Sun-Mar..1st-Sun-Nov) ---
+    // --- North America (US/CA DST: 2nd Sun Mar to 1st Sun Nov) ---
     { "America/St_Johns",    "NST3:30NDT,M3.2.0,M11.1.0" },
     { "America/Halifax",     "AST4ADT,M3.2.0,M11.1.0" },
     { "America/New_York",    "EST5EDT,M3.2.0,M11.1.0" },
@@ -281,21 +282,21 @@ static const TzEntry TZ_TABLE[] = {
 };
 #define TZ_TABLE_N (sizeof(TZ_TABLE) / sizeof(TZ_TABLE[0]))
 
-// Resolve an IANA name to POSIX; pass through unknown values (already POSIX).
+// Convert an IANA name to POSIX. Pass unknown values through (already POSIX).
 static const char *tzToPosix(const char *tz) {
     for (unsigned i = 0; i < TZ_TABLE_N; i++)
         if (!strcmp(TZ_TABLE[i].name, tz)) return TZ_TABLE[i].posix;
     return tz;
 }
 
-// (Re)apply the NTP + timezone config. Safe to call repeatedly (e.g. on save).
+// Apply the NTP and timezone config. You can call this again safely, e.g. on save.
 static void applyNtp() {
     const char *s1 = cfg.ntp1[0] ? cfg.ntp1 : "pool.ntp.org";
     const char *s2 = cfg.ntp2[0] ? cfg.ntp2 : nullptr;
     const char *s3 = cfg.ntp3[0] ? cfg.ntp3 : nullptr;
     configTzTime(tzToPosix(cfg.tz[0] ? cfg.tz : "Europe/Moscow"), s1, s2, s3);
 }
-// UTC epoch seconds, or 0 until NTP has actually synced (guards the 1970 window).
+// UTC epoch seconds. It returns 0 until NTP syncs. This guards the 1970 window.
 static uint32_t epochNow() {
     time_t t = time(nullptr);
     return t > 1600000000 ? (uint32_t)t : 0;   // 1600000000 = 2020-09
@@ -313,7 +314,7 @@ static void extractSerial(const char *blob, char *out, size_t n) {
 }
 
 static void pollPack(Pack &p, bool deep) {
-    esm.setTarget(p.addr, false);        // 8N1 (also (re)starts the UART)
+    esm.setTarget(p.addr, false);        // 8N1 (this also restarts the UART)
     if (!p.authed) {
         esm.wake();
         p.authed = esm.authenticate();
@@ -323,17 +324,17 @@ static void pollPack(Pack &p, bool deep) {
         if (esm.readArchiveInfo(blob, sizeof(blob))) extractSerial(blob, sn, sizeof(sn));
         if (sn[0] && xSemaphoreTake(mux, pdMS_TO_TICKS(50)) == pdTRUE) {
             strncpy(p.serial, sn, sizeof(p.serial)); p.serial[sizeof(p.serial) - 1] = 0;
-            xSemaphoreGive(mux);                 // guard the cross-task serial read
+            xSemaphoreGive(mux);                 // guards the cross-task serial read
         }
     }
     EsmMainData d;
     if (!esm.readMainData(d)) {
-        if (++p.fails >= 3) { p.authed = false; p.fails = 0; }  // force re-auth
+        if (++p.fails >= 3) { p.authed = false; p.fails = 0; }  // force a re-auth
         return;
     }
     p.fails = 0;
 
-    PackSnapshot n = p.s;                 // build into a local, publish atomically
+    PackSnapshot n = p.s;                 // build into a local copy, then publish atomically
     n.packV = d.batteryVoltage * 0.01f;
     n.busV = d.busbarVoltage * 0.01f;
     n.current = d.current * 0.01f;
@@ -370,10 +371,11 @@ static void pollPack(Pack &p, bool deep) {
     if (xSemaphoreTake(mux, pdMS_TO_TICKS(50)) == pdTRUE) { p.s = n; xSemaphoreGive(mux); }
 }
 
-// Combine the fresh packs into `agg`. Called on the ESM task, under mux.
-// Rules: paralleled bus so V averages; current & capacity & limits sum; SOC
-// averages (all 100Ah); charge-cutoff on the highest cell, discharge on the
-// lowest; temps take the extremes; a fault on any pack raises the bank fault.
+// Combine the fresh packs into `agg`. The ESM task calls this under mux.
+// Rules for the parallel bus: average the voltage; sum the current, capacity,
+// and limits; average the SOC (all packs are 100Ah); set charge cutoff on the
+// highest cell and discharge cutoff on the lowest; take the temperature
+// extremes; a fault on any pack raises the bank fault.
 static void aggregate() {
     uint32_t now = millis();
     int n = 0;
@@ -392,35 +394,35 @@ static void aggregate() {
         bankMaxT = max<int16_t>(bankMaxT, p.s.tmax);
         bankMinT = min<int16_t>(bankMinT, p.s.tmin);
         if (maxCyc < p.s.cycles) maxCyc = p.s.cycles;
-        // per-pack cell extremes
+        // cell extremes per pack
         for (uint8_t c = 0; c < p.s.nCells; c++) {
             if (p.s.cells[c] > bankMaxCell) bankMaxCell = p.s.cells[c];
             if (p.s.cells[c] < bankMinCell) bankMinCell = p.s.cells[c];
         }
-        // Limits: sum EFFECTIVE per-pack amps (deci-A); the bank coef is set to
-        // 100 (no-op) below so buildCmd63 doesn't apply it a second time. A full
-        // pack tapers its own CCL, so summing the effective values gives the true
-        // bank limit. Fail-safe: a pack whose limit block never read (raw==0)
-        // contributes ZERO headroom rather than an invented default — under
-        // normal operation every reachable pack is deep-read on the first pass.
+        // Limits: sum the EFFECTIVE per-pack amps (deci-A). The bank coef is set
+        // to 100 (no-op) below, so buildCmd63 does not apply it a second time. A
+        // full pack tapers its own CCL, so the sum of the effective values gives
+        // the true bank limit. Fail-safe: a pack whose limit block never read
+        // (raw==0) adds ZERO headroom, not an invented default. In normal
+        // operation the code deep-reads every reachable pack on the first pass.
         uint32_t cclE = p.s.ccl_raw;
         uint32_t dclE = p.s.dcl_raw;
-        // Coefficient (regs 0x1011/0x1018, %) only DERATES. Clamp to 100 so a
-        // corrupt/oversized read (e.g. 0xFFFF) can never inflate the limit; a 0
-        // coef leaves the raw value unscaled (matches the proven emitter).
+        // The coefficient (registers 0x1011/0x1018, %) only DERATES. Clamp it to
+        // 100, so a corrupt or oversized read (e.g. 0xFFFF) can never inflate the
+        // limit. A 0 coef leaves the raw value unscaled (matches the proven emitter).
         uint16_t cclC = p.s.ccl_coef > 100 ? 100 : p.s.ccl_coef;
         uint16_t dclC = p.s.dcl_coef > 100 ? 100 : p.s.dcl_coef;
         if (cclE && cclC) cclE = cclE * cclC / 100;
         if (dclE && dclC) dclE = dclE * dclC / 100;
         sumCcl += cclE;
         sumDcl += dclE;
-        // Voltages are common to the parallel bus, not summed. Charge to the
-        // lowest CVL and stop discharge at the highest DVL any pack reports —
-        // the most conservative choice when packs disagree slightly.
+        // The parallel bus shares the voltages, so do not sum them. Charge to the
+        // lowest CVL and stop discharge at the highest DVL that any pack reports.
+        // This is the most conservative choice when packs disagree a little.
         if (p.s.cvl_raw && (!cvl || p.s.cvl_raw < cvl)) cvl = p.s.cvl_raw;
         if (p.s.dvl_raw && (!dvl || p.s.dvl_raw > dvl)) dvl = p.s.dvl_raw;
     }
-    if (!cvl) cvl = 540;      // 54.0 V fallback if no pack reported a limit
+    if (!cvl) cvl = 540;      // fallback 54.0 V if no pack reported a limit
     if (!dvl) dvl = 475;      // 47.5 V
 
     PackSnapshot a;
@@ -431,7 +433,7 @@ static void aggregate() {
         a.soc = sumSoc / n;
         a.soh = minSoh;
         a.tmin = bankMinT; a.tmax = bankMaxT;
-        a.nTemps = 0;                                // emu falls back to tmin/tmax
+        a.nTemps = 0;                                // the emulator falls back to tmin/tmax
         a.cycles = maxCyc;
         if (bankMaxCell) { a.cells[0] = bankMaxCell; a.cells[1] = bankMinCell; a.nCells = 2; }
         else a.nCells = 0;
@@ -446,12 +448,12 @@ static void aggregate() {
 
 static void esmTask(void *) {
     for (unsigned i = 0; i < NUM_PACKS; i++) pk[i].addr = PACK_ADDR[i];
-    esm.setTarget(PACK_ADDR[0], false);  // start UART1 on the ESM bus
+    esm.setTarget(PACK_ADDR[0], false);  // starts UART1 on the ESM bus
     delay(200);
     uint32_t deepCtr = 0;
     for (;;) {
         for (unsigned i = 0; i < NUM_PACKS; i++) {
-            bool deep = (deepCtr++ % (NUM_PACKS * 3)) < NUM_PACKS;   // cells/limits ~1/3 of passes
+            bool deep = (deepCtr++ % (NUM_PACKS * 3)) < NUM_PACKS;   // read cells and limits on about 1/3 of passes
             pollPack(pk[i], deep);
         }
         if (xSemaphoreTake(mux, pdMS_TO_TICKS(50)) == pdTRUE) { aggregate(); xSemaphoreGive(mux); }
@@ -478,7 +480,7 @@ static bool         mqttWasOk = false;
 static void mqttReconnect() {
     if (!cfg.mqttEnable || !cfg.host[0] || !WiFi.isConnected()) return;
     mqtt.setServer(cfg.host, cfg.port);
-    mqtt.setBufferSize(1024);            // room for the full per-pack cell/temp arrays
+    mqtt.setBufferSize(1024);            // room for the full per-pack cell and temp arrays
     String id = "esmbank-" + String((uint32_t)ESP.getEfuseMac(), HEX);
     bool ok = cfg.user[0] ? mqtt.connect(id.c_str(), cfg.user, cfg.pass)
                           : mqtt.connect(id.c_str());
@@ -487,7 +489,7 @@ static void mqttReconnect() {
 
 static void mqttPublish() {
     if (!cfg.mqttEnable || !mqtt.connected()) return;
-    char topic[80], buf[768];            // per-pack payload w/ full cell+temp arrays + faults
+    char topic[80], buf[768];            // per-pack payload with full cell and temp arrays and faults
 
     PackSnapshot a; Pack local[NUM_PACKS];
     if (xSemaphoreTake(mux, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -497,7 +499,7 @@ static void mqttPublish() {
     } else return;
 
     uint32_t now = millis();
-    uint32_t ts = epochNow();            // 0 until NTP has synced
+    uint32_t ts = epochNow();            // 0 until NTP syncs
     int nfresh = 0;
     for (unsigned i = 0; i < NUM_PACKS; i++)
         if (local[i].s.valid && now - local[i].s.ts < STALE_MS) nfresh++;
@@ -549,11 +551,11 @@ static void mqttPublish() {
 // ---------------- Web UI ----------------
 static WebServer web(80);
 static DNSServer dnsServer;              // captive portal in setup-AP mode
-static bool      apMode = false;         // true = hosting the setup AP
+static bool      apMode = false;         // true = the device hosts the setup AP
 
-// Bring up WiFi: try the configured station, and if that fails (or nothing is
-// configured) fall back to hosting the setup AP with a captive portal so the
-// user can enter their network from a phone. RS485 translation runs either way.
+// Start WiFi: try the configured station. If that fails, or nothing is
+// configured, fall back to the setup AP with a captive portal. Then the user
+// can enter their network from a phone. RS485 translation runs either way.
 static void startWifi() {
     const char *ss = cfg.wifiSsid[0] ? cfg.wifiSsid : WIFI_SSID;
     const char *pw = cfg.wifiSsid[0] ? cfg.wifiPass : WIFI_PASS;
@@ -671,8 +673,9 @@ static void handleSave() {
     web.arg("ntp2").toCharArray(cfg.ntp2, sizeof(cfg.ntp2));
     web.arg("ntp3").toCharArray(cfg.ntp3, sizeof(cfg.ntp3));
     if (web.arg("tz").length()) web.arg("tz").toCharArray(cfg.tz, sizeof(cfg.tz));
-    // WiFi: update SSID if given; update password only if a new one was typed
-    // (a blank password field means "keep current"). Reboot to apply a change.
+    // WiFi: update the SSID if given. Update the password only if the user typed
+    // a new one (a blank password field means "keep the current one"). Reboot to
+    // apply a change.
     bool wifiChanged = false;
     if (web.hasArg("wssid") && web.arg("wssid").length()) {
         String ns = web.arg("wssid"), np = web.arg("wpass");
@@ -681,7 +684,7 @@ static void handleSave() {
         if (np.length()) { np.toCharArray(cfg.wifiPass, sizeof(cfg.wifiPass)); wifiChanged = true; }
     }
     saveCfg();
-    applyNtp();                          // re-sync with the new servers/TZ immediately
+    applyNtp();                          // re-sync with the new servers and TZ immediately
     if (mqtt.connected()) mqtt.disconnect();
     if (wifiChanged) {
         web.send(200, "text/html",
@@ -693,9 +696,9 @@ static void handleSave() {
     web.sendHeader("Location", "/"); web.send(303);
 }
 
-// Machine-readable diagnostics: aggregate limits (incl. CVL/DVL not shown on
-// the HTML page), the Deye poll counters, and each pack's raw limit registers
-// so the 0x100A block can be sanity-checked remotely. curl http://<ip>/status
+// Machine-readable diagnostics: the aggregate limits (with CVL/DVL, which the
+// HTML page does not show), the Deye poll counters, and the raw limit registers
+// of each pack. This lets you check the 0x100A block remotely. curl http://<ip>/status
 static void handleStatus() {
     PackSnapshot a; Pack local[NUM_PACKS];
     if (xSemaphoreTake(mux, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -760,10 +763,10 @@ static void handleUpdateDone() {
     ESP.restart();
 }
 // The Arduino WebServer runs the WHOLE multipart upload inside one blocking
-// handleClient() call. With the two RS485 tasks hammering CPU/heap (esmTask
-// reconfigures UART1 every poll; deyeTask preempts at prio 3) a long upload
-// starves the loop-task watchdog and resets mid-transfer. So suspend both
-// tasks for the duration and feed the WDT on each chunk; resume on abort.
+// handleClient() call. The two RS485 tasks load the CPU and heap heavily
+// (esmTask reconfigures UART1 each poll; deyeTask preempts at priority 3). Thus
+// a long upload starves the loop-task watchdog and resets mid-transfer. So
+// suspend both tasks for the upload and feed the WDT on each chunk. Resume on abort.
 static void handleUpdateUpload() {
     HTTPUpload &up = web.upload();
     if (up.status == UPLOAD_FILE_START) {
@@ -772,12 +775,12 @@ static void handleUpdateUpload() {
         Update.begin(UPDATE_SIZE_UNKNOWN);
     } else if (up.status == UPLOAD_FILE_WRITE) {
         Update.write(up.buf, up.currentSize);
-        vTaskDelay(1);                      // yield so IDLE1 runs -> feeds its WDT
+        vTaskDelay(1);                      // yield so IDLE1 runs and feeds its WDT
     } else if (up.status == UPLOAD_FILE_END) {
-        Update.end(true);                   // success -> handleUpdateDone reboots
+        Update.end(true);                   // on success, handleUpdateDone reboots
     } else if (up.status == UPLOAD_FILE_ABORTED) {
         Update.abort();
-        if (esmH)  vTaskResume(esmH);        // upload failed: keep translating
+        if (esmH)  vTaskResume(esmH);        // upload failed: continue translation
         if (deyeH) vTaskResume(deyeH);
     }
 }
@@ -799,7 +802,7 @@ void setup() {
     Serial2.begin(9600, SERIAL_8N1, DEYE_RX_PIN, DEYE_TX_PIN);
 
     startWifi();                         // station, or fall back to the setup AP
-    if (!apMode) applyNtp();             // SNTP only makes sense once online
+    if (!apMode) applyNtp();             // SNTP only works once online
 
     ArduinoOTA.setHostname("esm-bank");
     ArduinoOTA.setPassword(OTA_PASS);
@@ -808,7 +811,7 @@ void setup() {
     web.on("/", []() { web.send(200, "text/html", htmlPage()); });
     web.on("/save", HTTP_POST, handleSave);
     web.on("/status", handleStatus);
-    // captive portal: send any other URL to the config page (setup-AP UX)
+    // captive portal: send any other URL to the config page (setup-AP use)
     web.onNotFound([]() { web.sendHeader("Location", "/"); web.send(302, "text/plain", ""); });
     web.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
     web.begin();
@@ -827,7 +830,7 @@ void loop() {
     if (apMode) dnsServer.processNextRequest();
     if (mqtt.connected()) mqtt.loop();
 
-    // Station keepalive only in station mode; AP-mode retries would drop clients.
+    // Station keepalive runs only in station mode. AP-mode retries would drop clients.
     if (!apMode && now - lastWifi > 5000) {
         lastWifi = now;
         if (!WiFi.isConnected()) {

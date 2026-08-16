@@ -1,13 +1,13 @@
 #include <TFT_eSPI.h>
 #include "display.h"
 
-// Full-screen sprite (240x135x16bit = ~65 KB) so redraws don't flicker
+// Full-screen sprite (240x135x16bit = ~65 KB). This prevents redraw flicker.
 static TFT_eSPI tft;
 static TFT_eSprite spr(&tft);
 
 void displayInit() {
     tft.init();
-    tft.setRotation(1);  // landscape, 240x135, USB to the right
+    tft.setRotation(1);  // Landscape, 240x135, USB on the right
     pinMode(TFT_BL, OUTPUT);
     digitalWrite(TFT_BL, HIGH);
     spr.setColorDepth(16);
@@ -32,7 +32,7 @@ void displayTranslator(const TranslatorView &v) {
     spr.fillSprite(TFT_BLACK);
     char buf[48];
 
-    // --- header: title + ESM link state ---
+    // --- Header: title and ESM link state ---
     spr.setTextDatum(TL_DATUM);
     spr.setTextColor(TFT_CYAN, TFT_BLACK);
     spr.drawString("ESM", 6, 2, 2);
@@ -57,7 +57,7 @@ void displayTranslator(const TranslatorView &v) {
         uint16_t socCol = v.soc > 40 ? TFT_GREEN : v.soc > 15 ? TFT_YELLOW : TFT_RED;
         spr.setTextColor(socCol, TFT_BLACK);
         snprintf(buf, sizeof(buf), "%d%%", v.soc);
-        spr.drawString(buf, 6, 26, 6);            // big SOC digits
+        spr.drawString(buf, 6, 26, 6);            // Large SOC digits
 
         spr.setTextColor(TFT_WHITE, TFT_BLACK);
         snprintf(buf, sizeof(buf), "%.2fV", v.packV);
@@ -95,8 +95,8 @@ void displayTranslator(const TranslatorView &v) {
                  (unsigned long)(v.deyeAgeMs / 1000));
     spr.drawString(buf, 6, 100, 2);
 
-    // bottom line: forwarded limits once linked, else raw bus byte counters
-    // (the bring-up view — rx staying 0 means the battery isn't answering).
+    // Bottom line: show forwarded limits after link. If no link, show raw bus byte counters.
+    // This is the bring-up view. An rx count of 0 means the pack does not answer.
     if (v.haveLimits) {
         spr.setTextColor(TFT_SILVER, TFT_BLACK);
         snprintf(buf, sizeof(buf), "CCL %.1fA  DCL %.1fA", v.cclEff, v.dclEff);
@@ -122,7 +122,7 @@ void displayBank(const BankView &v) {
     spr.setTextDatum(TL_DATUM);
     spr.setTextColor(TFT_CYAN, TFT_BLACK);
     spr.drawString("ESM bank", 6, 2, 2);
-    // WiFi IP + MQTT dot, right side
+    // WiFi IP and MQTT dot, on the right side
     spr.setTextColor(v.mqttOn ? (v.mqttOk ? TFT_GREEN : TFT_RED) : TFT_DARKGREY, TFT_BLACK);
     spr.setTextDatum(TR_DATUM);
     spr.drawString(v.mqttOn ? (v.mqttOk ? "MQTT" : "mqtt?") : "", 234, 2, 2);
@@ -141,13 +141,13 @@ void displayBank(const BankView &v) {
         return;
     }
 
-    // big aggregate SOC
+    // Large aggregate SOC
     uint16_t socCol = v.soc > 40 ? TFT_GREEN : v.soc > 15 ? TFT_YELLOW : TFT_RED;
     spr.setTextColor(socCol, TFT_BLACK);
     snprintf(buf, sizeof(buf), "%d%%", v.soc);
     spr.drawString(buf, 6, 24, 6);
 
-    // V / A on the right
+    // Voltage and current on the right
     spr.setTextColor(TFT_WHITE, TFT_BLACK);
     snprintf(buf, sizeof(buf), "%.1fV", v.packV);
     spr.setTextDatum(TR_DATUM);
@@ -167,7 +167,7 @@ void displayBank(const BankView &v) {
         x += 58;
     }
 
-    // limits + link line
+    // Limits and link line
     spr.setTextColor(TFT_DARKCYAN, TFT_BLACK);
     snprintf(buf, sizeof(buf), "SOH %d%%  %d..%dC  CCL %dA DCL %dA",
              v.soh, v.tmin, v.tmax, v.cclA, v.dclA);
@@ -181,9 +181,9 @@ void displayBank(const BankView &v) {
     spr.pushSprite(0, 0);
 }
 
-// Register scaling for the ESM4875A1 is unconfirmed; pick a scale that
-// lands a 48 V-class pack in a plausible range. Serial output keeps
-// printing raw values so the guess can be verified and hardcoded later.
+// The register scale for the ESM4875A1 is not confirmed. Select a scale that
+// puts a 48 V-class pack in a probable range. Serial output continues to
+// print raw values. This lets you confirm the scale and set it in code later.
 static float scaleVoltage(uint16_t raw) {
     if (raw > 1000) return raw * 0.01f;   // 5342 -> 53.42 V
     if (raw > 100)  return raw * 0.1f;    //  534 -> 53.4 V
@@ -201,7 +201,7 @@ static float scaleCurrent(int16_t raw, uint8_t &decimals) {
 void displayData(const EsmMainData &d, const EsmStatusBits &s, bool statusValid) {
     spr.fillSprite(TFT_BLACK);
 
-    // --- SOC row: big number + bar ---
+    // --- SOC row: large number and bar ---
     uint16_t socColor = d.soc > 40 ? TFT_GREEN : d.soc > 15 ? TFT_YELLOW : TFT_RED;
     spr.setTextDatum(TL_DATUM);
     spr.setTextColor(socColor, TFT_BLACK);
@@ -214,14 +214,14 @@ void displayData(const EsmMainData &d, const EsmStatusBits &s, bool statusValid)
     int fill = (barW - 4) * min<uint16_t>(d.soc, 100) / 100;
     spr.fillRect(barX + 2, barY + 2, fill, barH - 4, socColor);
 
-    // --- voltage / current row ---
+    // --- Voltage and current row ---
     spr.setTextColor(TFT_WHITE, TFT_BLACK);
     snprintf(buf, sizeof(buf), "%.2fV", scaleVoltage(d.batteryVoltage));
     spr.drawString(buf, 6, 52, 4);
 
     uint8_t dec;
     float amps = scaleCurrent(d.current, dec);
-    // charging = positive, discharging = negative
+    // Positive current is charge. Negative current is discharge.
     spr.setTextColor(d.current > 0 ? TFT_GREEN : d.current < 0 ? TFT_ORANGE : TFT_SILVER,
                      TFT_BLACK);
     snprintf(buf, sizeof(buf), "%+.*fA", dec, amps);
@@ -229,7 +229,7 @@ void displayData(const EsmMainData &d, const EsmStatusBits &s, bool statusValid)
     spr.drawString(buf, 234, 52, 4);
     spr.setTextDatum(TL_DATUM);
 
-    // --- SOH / temperature row ---
+    // --- SOH and temperature row ---
     spr.setTextColor(TFT_SILVER, TFT_BLACK);
     snprintf(buf, sizeof(buf), "SOH %u%%", d.soh);
     spr.drawString(buf, 6, 86, 2);
@@ -238,7 +238,7 @@ void displayData(const EsmMainData &d, const EsmStatusBits &s, bool statusValid)
     spr.drawString(buf, 234, 86, 2);
     spr.setTextDatum(TL_DATUM);
 
-    // --- fault / warning row ---
+    // --- Fault and warning row ---
     if (statusValid) {
         bool anyFault = s.systemFaults || s.cellFaults || s.activeProtections;
         if (anyFault || s.activeWarnings) {

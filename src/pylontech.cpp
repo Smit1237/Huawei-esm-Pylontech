@@ -1,6 +1,6 @@
 #include "pylontech.h"
 
-// ---- YDN1363 framing (identical to deye_bms.py) ----
+// ---- YDN1363 framing. This is the same as deye_bms.py. ----
 
 static uint16_t chksum(const char *body, size_t n) {
     uint32_t s = 0;
@@ -8,14 +8,14 @@ static uint16_t chksum(const char *body, size_t n) {
     return (uint16_t)((~s + 1) & 0xFFFF);
 }
 
-// LENGTH field = 4 hex chars: a 4-bit checksum nibble then the 12-bit length
+// LENGTH field has 4 hex characters: a 4-bit checksum nibble, then the 12-bit length.
 static void lengthField(uint16_t infoLen, char out[5]) {
     uint16_t n = (infoLen & 0xF) + ((infoLen >> 4) & 0xF) + ((infoLen >> 8) & 0xF);
     uint16_t lchk = (uint16_t)((~n & 0xF) + 1);
     snprintf(out, 5, "%1X%03X", (unsigned)(lchk & 0xF), (unsigned)(infoLen & 0xFFF));
 }
 
-// deci-Kelvin, the Pylontech temperature unit
+// deci-Kelvin is the Pylontech temperature unit.
 static uint16_t deciK(float celsius) {
     return (uint16_t)lroundf((celsius + 273.15f) * 10.0f);
 }
@@ -25,7 +25,7 @@ void PylontechEmu::sendFrame(const char *info) {
     char lf[5];
     size_t infoLen = strlen(info);
     lengthField((uint16_t)infoLen, lf);
-    // VER=20, ADR, CID1=46, RTN=00, LENGTH, INFO
+    // Fields: VER=20, ADR, CID1=46, RTN=00, LENGTH, INFO
     int bn = snprintf(body, sizeof(body), "20%02X4600%s%s", _addr, lf, info);
     if (bn <= 0 || (size_t)bn >= sizeof(body)) return;
 
@@ -37,7 +37,7 @@ void PylontechEmu::sendFrame(const char *info) {
     answered++;
 #ifdef BUS_DEBUG
     Serial.print("[DEYE TX] ");
-    Serial.write((const uint8_t *)out, (size_t)on - 1);   // drop trailing CR
+    Serial.write((const uint8_t *)out, (size_t)on - 1);   // Remove the last CR character.
     Serial.println();
 #endif
 }
@@ -71,9 +71,9 @@ void PylontechEmu::buildCmd61(const PackSnapshot &s, char *out, size_t n) {
         tmaxK = deciK(s.tmax); tminK = deciK(s.tmin);
     }
 
-    // The 0101/0108/0103/0109 markers are fixed protocol constants — the
-    // Deye's per-cell page cannot be addressed through 0x61 (summary-only
-    // format), confirmed by experiment. Keep the proven reference values.
+    // The 0101/0108/0103/0109 markers are fixed protocol constants. You
+    // cannot address the Deye per-cell page through 0x61, which is a
+    // summary-only format. A test confirms this. Keep the reference values.
     snprintf(out, n,
              "%04X%04X%02X%04X%04X%02X%02X"
              "%04X0101%04X0108"
@@ -89,21 +89,21 @@ void PylontechEmu::buildCmd61(const PackSnapshot &s, char *out, size_t n) {
 
 void PylontechEmu::buildCmd62(const PackSnapshot &s, char *out, size_t n) {
     (void)s;
-    // all-normal unless the pack reports a fault; keep it simple/safe
+    // Report all-normal unless the pack shows a fault. Keep this simple and safe.
     snprintf(out, n, "00000000");
 }
 
 void PylontechEmu::buildCmd63(const PackSnapshot &s, char *out, size_t n) {
-    const uint8_t status = 0xC0;   // bit7 charge enable, bit6 discharge enable
-    // Forward the battery's own limit registers. ESM voltage regs are 0.1 V
-    // -> mV (x100); current regs are already 0.1 A = the Deye's deci-amp
-    // unit, so they pass straight through (e.g. 693 -> 69.3 A).
+    const uint8_t status = 0xC0;   // bit7 is charge enable. bit6 is discharge enable.
+    // Forward the limit registers of the battery. ESM voltage registers are
+    // 0.1 V. Multiply by 100 to get mV. Current registers are already 0.1 A,
+    // which is the Deye deci-amp unit, so they pass through (e.g. 693 -> 69.3 A).
     uint32_t cvl_mv = (uint32_t)(s.cvl_raw ? s.cvl_raw : 540) * 100;
     uint32_t dvl_mv = (uint32_t)(s.dvl_raw ? s.dvl_raw : 475) * 100;
     uint32_t ccl_da = s.ccl_raw ? s.ccl_raw : 500;
     uint32_t dcl_da = s.dcl_raw ? s.dcl_raw : 500;
-    // Apply the pack's own charge/discharge limit coefficient (%, regs
-    // 0x1011 / 0x1018): e.g. 693 * 85% = 589 -> 58.9 A.
+    // Apply the charge and discharge limit coefficient of the pack (%,
+    // registers 0x1011 / 0x1018): e.g. 693 * 85% = 589 -> 58.9 A.
     if (s.ccl_coef) ccl_da = ccl_da * s.ccl_coef / 100;
     if (s.dcl_coef) dcl_da = dcl_da * s.dcl_coef / 100;
     snprintf(out, n, "%04X%04X%04X%04X%02X",
@@ -115,13 +115,13 @@ void PylontechEmu::poll(const PackSnapshot &s) {
     while (_port.available()) {
         char c = (char)_port.read();
         if (c == '\r') {
-            // complete frame in _buf[0.._len)
+            // The complete frame is in _buf[0.._len).
             if (_len >= 9 && _buf[0] == '~') {
 #ifdef BUS_DEBUG
                 _buf[_len] = 0;
                 Serial.print("[DEYE RX] "); Serial.println(_buf);
 #endif
-                const char *b = _buf + 1;          // skip '~'
+                const char *b = _buf + 1;          // Skip the '~' character.
                 char tmp[3] = { 0, 0, 0 };
                 tmp[0] = b[2]; tmp[1] = b[3];
                 uint8_t adr = (uint8_t)strtol(tmp, nullptr, 16);
@@ -146,7 +146,7 @@ void PylontechEmu::poll(const PackSnapshot &s) {
             _len = 0;
         } else {
             if (_len < sizeof(_buf) - 1) _buf[_len++] = c;
-            else _len = 0;                       // overlong garbage -> resync
+            else _len = 0;                       // Data too long. Reset to resynchronize.
         }
     }
 }

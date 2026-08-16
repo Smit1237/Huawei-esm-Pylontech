@@ -1,13 +1,13 @@
 #include "huawei_esm.h"
 
-Print *g_esmLog = &Serial;   // redirectable (see huawei_esm.h)
+Print *g_esmLog = &Serial;   // You can redirect this. Refer to huawei_esm.h.
 
 static const uint32_t ESM_BAUD = 9600;
 
 #ifdef ESM_DEBUG_FRAMES
-// Compose the whole line into one buffer and emit it with a single write, so
-// dumps from the ESM task don't interleave char-by-char with the Deye task's
-// dumps on the shared USB console.
+// Build the whole line in one buffer. Send it with one write.
+// This keeps the ESM task dumps separate from the Deye task
+// dumps on the shared USB console, not mixed byte by byte.
 static void dumpFrame(const char *dir, const uint8_t *buf, size_t len) {
     char line[8 + 3 * 64];
     int n = snprintf(line, sizeof(line), "[ESM %s %2u]", dir, (unsigned)len);
@@ -43,9 +43,10 @@ uint16_t HuaweiESM::crc16(const uint8_t *data, size_t len) {
     return crc;
 }
 
-// Sends req (CRC appended here), collects a reply until the line goes
-// quiet for 25 ms (~20 char times at 9600 — safely past a frame gap).
-// Returns reply length after CRC check, 0 on timeout/CRC error.
+// Send req. This function adds the CRC. Collect the reply until the
+// line stays quiet for 25 ms (about 20 character times at 9600 baud,
+// past a frame gap). Return the reply length after the CRC check.
+// Return 0 for a timeout or a CRC error.
 size_t HuaweiESM::transact(const uint8_t *req, size_t reqLen,
                            uint8_t *resp, size_t respMax, uint32_t timeoutMs) {
     uint8_t frame[64];
@@ -55,7 +56,7 @@ size_t HuaweiESM::transact(const uint8_t *req, size_t reqLen,
     frame[reqLen]     = crc & 0xFF;
     frame[reqLen + 1] = crc >> 8;
 
-    while (_port.available()) _port.read();  // drop stale bytes
+    while (_port.available()) _port.read();  // Remove old bytes.
     dumpFrame("TX", frame, reqLen + 2);
     _port.write(frame, reqLen + 2);
     _port.flush();
@@ -71,15 +72,15 @@ size_t HuaweiESM::transact(const uint8_t *req, size_t reqLen,
             rxBytes++;
             lastByte = millis();
         } else if (len > 0 && millis() - lastByte > 25) {
-            break;  // frame complete
+            break;  // The frame is complete.
         } else if (millis() - start > timeoutMs) {
             if (len == 0) return 0;
             break;
         } else {
-            // Yield while waiting for bytes. Busy-spinning here starves the
-            // RTOS idle task when this runs in a pinned FreeRTOS task (the
-            // translator), tripping the ESP32 task watchdog; the UART FIFO
-            // buffers incoming bytes so a 1 ms poll interval loses nothing.
+            // Yield while the function waits for bytes. A busy loop starves
+            // the RTOS idle task when this code runs in a pinned FreeRTOS
+            // task (the translator). This trips the ESP32 task watchdog.
+            // The UART FIFO holds incoming bytes, so a 1 ms poll loses none.
             delay(1);
         }
     }
@@ -126,7 +127,7 @@ bool HuaweiESM::probe() {
 }
 
 bool HuaweiESM::wake() {
-    // Escalating delays: the BMS comms can take a while to come up
+    // Use larger delays each time. The BMS communication can need time to start.
     const uint32_t delays[] = { 1000, 2000, 4000, 8000, 16000 };
     for (uint32_t d : delays) {
         uint16_t v;
@@ -142,9 +143,9 @@ bool HuaweiESM::readClock(uint16_t out[6]) {
 }
 
 bool HuaweiESM::fc10TimeSync() {
-    // The BMS expects a wall-clock write during the handshake. Prefer
-    // writing its OWN current time back (preserves the battery clock);
-    // fall back to firmware build time if the read fails.
+    // The BMS expects a wall-clock write during the handshake.
+    // Write its own current time back first. This keeps the battery
+    // clock. If the read fails, use the firmware build time.
     uint16_t vals[6];
     if (!readClock(vals)) {
         // __DATE__ = "Jul  4 2026", __TIME__ = "12:34:56"
@@ -170,7 +171,7 @@ bool HuaweiESM::fc10TimeSync() {
 }
 
 bool HuaweiESM::fc41Access() {
-    // documented frame: [addr] 41 05 01 04
+    // Documented frame: [addr] 41 05 01 04
     uint8_t req[5] = { _addr, 0x41, 0x05, 0x01, 0x04 };
     uint8_t resp[32];
     size_t len = transact(req, sizeof(req), resp, sizeof(resp), 2000);
@@ -178,7 +179,7 @@ bool HuaweiESM::fc41Access() {
 }
 
 bool HuaweiESM::authenticate() {
-    // Phase 1: "unlock" read of register 0x0106
+    // Phase 1: unlock read of register 0x0106.
     uint16_t v;
     if (!fc03(0x0106, 1, &v, 1000)) {
         g_esmLog->println("  auth phase 1 (FC03 0x0106): no/bad reply");
@@ -186,14 +187,14 @@ bool HuaweiESM::authenticate() {
     }
     delay(600);
 
-    // Phase 2: date/time sync
+    // Phase 2: date and time sync.
     if (!fc10TimeSync()) {
         g_esmLog->println("  auth phase 2 (FC10 time sync): no/bad reply");
         return false;
     }
     delay(600);
 
-    // Phase 3: FC41 access grant
+    // Phase 3: FC41 access grant.
     if (!fc41Access()) {
         g_esmLog->println("  auth phase 3 (FC41 access): no/bad reply");
         return false;
@@ -252,14 +253,14 @@ size_t HuaweiESM::readArchiveInfo(char *buf, size_t maxLen) {
         uint8_t resp[256];
         size_t len = transact(req, sizeof(req), resp, sizeof(resp), 2000);
         if (len < 9) break;
-        // payload starts at [6]: [3..5] are a chunk header (length byte
-        // 0x43 = 'C' plus counters) that otherwise litters the text
+        // The payload starts at [6]. Bytes [3..5] are a chunk header
+        // (length byte 0x43 = 'C' plus counters) that litters the text.
         for (size_t i = 6; i < len - 2 && n + 1 < maxLen; i++) {
             char c = (char)resp[i];
             if (c >= 32 && c < 127) {
                 buf[n++] = c;
             } else if (n && buf[n - 1] != '\n') {
-                buf[n++] = '\n';   // collapse control-byte runs
+                buf[n++] = '\n';   // Collapse runs of control bytes.
             }
         }
         delay(150);
@@ -269,9 +270,9 @@ size_t HuaweiESM::readArchiveInfo(char *buf, size_t maxLen) {
 }
 
 void HuaweiESM::printDeviceInfo(Stream &console) {
-    // FC41 sub-command 03 04: device info by index (ASCII key=value data)
+    // FC41 sub-command 03 04: device info by index (ASCII key=value data).
     for (uint8_t idx = 0; idx <= 5; idx++) {
-        // request layout: [addr] 41 06 03 04 00 [index]
+        // Request layout: [addr] 41 06 03 04 00 [index]
         uint8_t req[7] = { _addr, 0x41, 0x06, 0x03, 0x04, 0x00, idx };
         uint8_t resp[256];
         size_t len = transact(req, sizeof(req), resp, sizeof(resp), 2000);

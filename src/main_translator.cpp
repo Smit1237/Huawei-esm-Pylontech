@@ -1,24 +1,25 @@
 // Standalone ESM <-> Pylontech translator for the Deye BMS port.
 //
-// Replaces the gateway PC entirely: the ESP32 reads the Huawei ESM pack on
-// one RS485 bus and emulates a Pylontech battery to the Deye inverter on a
-// second RS485 bus (Deye "Lithium mode 12"). Both sides are the proven
-// implementations — huawei_esm.cpp (Modbus + FC41 handshake) and
+// This firmware replaces the gateway PC. The ESP32 reads the Huawei ESM pack
+// on one RS485 bus. The ESP32 emulates a Pylontech battery to the Deye inverter
+// on a second RS485 bus (Deye "Lithium mode 12"). Both sides use the proven
+// code: huawei_esm.cpp (Modbus and FC41 handshake) and
 // pylontech.cpp (ported from tools/deye/deye_bms.py).
 //
-// WHY DUAL-CORE: the Deye polls ~1.7x/s and expects a prompt answer, while an
-// ESM Modbus transaction can block for up to a second. The two jobs run as
-// separate FreeRTOS tasks pinned to different cores, sharing one mutexed
-// snapshot — so a slow battery read can never delay an inverter reply. This
-// is the on-chip equivalent of the two separate Python processes + HTTP cache.
+// DUAL-CORE REASON: the Deye polls about 1.7 times per second and needs a fast
+// answer. An ESM Modbus transaction can block for up to one second. The two
+// jobs run as separate FreeRTOS tasks. Each task is pinned to a different core.
+// The two tasks share one snapshot with a mutex. Thus a slow pack read cannot
+// delay an inverter reply. This equals the two separate Python processes and
+// the HTTP cache, but on one chip.
 //
-// WIRING — two auto-direction RS485 modules (VCC/GND/TXD/RXD only).
-// STRAIGHT THROUGH, not crossed: these modules name their pins by signal
-// function, so TXD takes the MCU's TX and RXD feeds the MCU's RX. This is
-// the wiring proven in README.md ("TXD | GPIO4 (TX)", "RXD | GPIO5 (RX)").
+// WIRING — two auto-direction RS485 modules (VCC, GND, TXD, and RXD only).
+// Connect straight through. Do not cross the wires. These modules name their
+// pins by signal function. Thus TXD takes the MCU TX, and RXD feeds the MCU RX.
+// README.md proves this wiring ("TXD | GPIO4 (TX)", "RXD | GPIO5 (RX)").
 //   ESM  side: ESP32 GPIO33 (TX) -> module TXD,  GPIO32 (RX) <- module RXD
 //   Deye side: ESP32 GPIO26 (TX) -> module TXD,  GPIO25 (RX) <- module RXD
-//   Both modules: VCC -> 5V (as proven; see README), GND -> ESP32 GND
+//   Both modules: VCC -> 5V (proven; see README), GND -> ESP32 GND
 //   ESM module  A+/B- -> battery RJ45 pins 1+4 / 2+5
 //   Deye module A+/B- -> inverter BMS RJ45 (see README for its pinout)
 
@@ -48,21 +49,21 @@
 static HuaweiESM   esm(Serial1, ESM_RX_PIN, ESM_TX_PIN);
 static PylontechEmu deye(Serial2, DEYE_ADDR);
 
-static PackSnapshot     shared;          // guarded by snapMux
+static PackSnapshot     shared;          // snapMux guards this snapshot
 static SemaphoreHandle_t snapMux;
 
-// ESM link state for the display (pointer to a literal -> atomic to publish)
+// ESM link state for the display. A pointer to a literal makes the publish atomic.
 static volatile const char *g_esmState = "PROBE";
 static volatile int         g_esmAddr  = 0;
 
-static const uint32_t SLOW_MS = 10000;   // cells / cycles / limits cadence
+static const uint32_t SLOW_MS = 10000;   // cadence for cells, cycles, and limits
 
 // ---------------- ESM side (core 0) ----------------
 
-// One-shot inventory printed when a pack first links: reads and dumps EVERY
-// queryable field so we can confirm each Modbus query individually, not just
-// that the link came up. Any "READ FAILED" line pinpoints exactly which query
-// the battery won't serve.
+// Print a one-time inventory when a pack first links. Read and dump every
+// queryable field. This confirms each Modbus query on its own, not only that
+// the link came up. A "READ FAILED" line shows exactly which query the pack
+// does not serve.
 static void dumpEverything() {
     Serial.println("\n===== ESM FULL QUERY DUMP =====");
     Serial.printf("addr %u  parity %s\n", esm.slaveAddr(),
@@ -129,7 +130,7 @@ static void dumpEverything() {
 }
 
 static void esmTask(void *) {
-    // probe() opens the port and sweeps addresses 214..218 across 8N1/8E1
+    // probe() opens the port and sweeps addresses 214..218 across 8N1 and 8E1
     for (;;) {
         g_esmState = "PROBE"; g_esmAddr = 0;
         Serial.println("[esm] probing bus ...");
@@ -149,14 +150,14 @@ static void esmTask(void *) {
         }
         g_esmState = "LINK";
         Serial.println("[esm] authenticated");
-        dumpEverything();      // one-shot full inventory for verification
+        dumpEverything();      // one-time full inventory for verification
 
         uint32_t lastSlow = 0;
-        bool     firstSlow = true;   // force the slow reads on iteration 1 so
-                                     // the first snapshot carries REAL limits/
-                                     // cells/cycles, not the fallbacks — the
-                                     // Python poller gets this for free by
-                                     // gating on a unix timestamp
+        bool     firstSlow = true;   // Force the slow reads on iteration 1. Thus
+                                     // the first snapshot carries real limits,
+                                     // cells, and cycles, not the fallbacks. The
+                                     // Python poller does this with a gate on a
+                                     // unix timestamp.
         uint8_t  fails = 0;
         PackSnapshot local;
 
@@ -188,7 +189,7 @@ static void esmTask(void *) {
                 if (esm.readStats(cyc, ah))
                     local.cycles = cyc > 65535 ? 65535 : (uint16_t)cyc;
 
-                // limit registers 0x100A..0x1018 — indices per esm_web.py
+                // limit registers 0x100A..0x1018 — indices from esm_web.py
                 uint16_t lim[15];
                 if (esm.readRegisters(0x100A, 15, lim)) {
                     local.cvl_raw  = lim[0];    // 0.1 V charge voltage
@@ -212,7 +213,7 @@ static void esmTask(void *) {
         g_esmState = "STALE";
         Serial.println("[esm] lost the battery, re-probing");
         if (xSemaphoreTake(snapMux, pdMS_TO_TICKS(50)) == pdTRUE) {
-            shared.valid = false;           // stop feeding the Deye stale data
+            shared.valid = false;           // stop the supply of stale data to the Deye
             xSemaphoreGive(snapMux);
         }
     }
@@ -227,9 +228,9 @@ static void deyeTask(void *) {
             mine = shared;
             xSemaphoreGive(snapMux);
         }
-        // Refuse to answer with stale data: if the pack has been unreadable
-        // for >15 s, go silent so the inverter raises a BMS-comms fault
-        // rather than acting on numbers that no longer reflect the battery.
+        // Do not answer with stale data. If the pack stays unreadable for
+        // more than 15 s, stay silent. Then the inverter raises a BMS-comms
+        // fault instead of an action on numbers that do not match the pack.
         if (mine.valid && millis() - mine.ts > 15000) mine.valid = false;
         deye.poll(mine);
         vTaskDelay(pdMS_TO_TICKS(2));
@@ -268,9 +269,9 @@ void loop() {
     bool fresh = s.valid && (now - s.ts < 15000);
 
 #ifdef USE_DISPLAY
-    // Refresh at ~2.5 Hz from loopTask (core 1, prio 1). The Deye responder
-    // runs at prio 3, so it always preempts a redraw — a slow SPI push can
-    // never delay an inverter reply.
+    // Refresh at about 2.5 Hz from loopTask (core 1, prio 1). The Deye
+    // responder runs at prio 3. Thus it always preempts a redraw. A slow SPI
+    // push cannot delay an inverter reply.
     if (now - lastDisp >= 400) {
         lastDisp = now;
         uint32_t cc = s.ccl_coef ? s.ccl_coef : 100;

@@ -3,30 +3,30 @@
 
 void displayInit();
 
-// Full-screen status message (probe/wake/auth/error states)
+// Full-screen status message. It shows the probe, wake, auth, and error states.
 void displayStatus(const char *line1, const char *line2 = "");
 
-// Main data screen. statusValid gates the fault/warning row.
+// Main data screen. The statusValid flag controls the fault and warning row.
 void displayData(const EsmMainData &d, const EsmStatusBits &s, bool statusValid);
 
-// ---- ESM <-> Deye translator debug screen ----
-// Plain values only, so this header stays independent of pylontech.h.
+// ---- ESM to and from Deye translator debug screen ----
+// This screen uses plain values only. Thus the header stays independent of pylontech.h.
 struct TranslatorView {
     // ESM side
-    bool        packValid;      // have we got fresh pack data?
-    const char *esmState;       // "PROBE" / "AUTH" / "LINK" / "STALE"
+    bool        packValid;      // Set to true when fresh pack data is available.
+    const char *esmState;       // State text: "PROBE", "AUTH", "LINK", or "STALE".
     int         soc, soh;
-    float       packV, current; // V, A (+ = charge)
+    float       packV, current; // Pack voltage in V and current in A. A positive current shows charge.
     int         tmin, tmax, cycles;
-    int         addr;           // 0 if not yet found
+    int         addr;           // Address. A value of 0 shows the address is not found yet.
     // Deye side
-    uint32_t    deyeAnswered;   // total frames answered
-    uint32_t    deyeAgeMs;      // ms since last poll; UINT32_MAX = never
-    const char *deyeCid2;       // last command ("61"/"62"/"63" or "-")
-    // forwarded limits (effective, A) — shown only if haveLimits
+    uint32_t    deyeAnswered;   // Total number of frames answered.
+    uint32_t    deyeAgeMs;      // Time in ms since the last poll. UINT32_MAX shows no poll yet.
+    const char *deyeCid2;       // Last command: "61", "62", "63", or "-".
+    // Forwarded limits in A (effective). Shown only when haveLimits is true.
     bool        haveLimits;
     float       cclEff, dclEff;
-    // raw ESM bus byte counters (rx==0 while tx climbs => no reply)
+    // Raw ESM bus byte counters. If rx stays 0 while tx climbs, there is no reply.
     uint32_t    esmTx, esmRx;
 };
 void displayTranslator(const TranslatorView &v);
@@ -34,17 +34,17 @@ void displayTranslator(const TranslatorView &v);
 // ---- multi-pack bank screen ----
 struct BankView {
     bool     valid;
-    int      nPacks;          // packs currently reporting
-    int      soc, soh;        // aggregate
-    float    packV, current;  // V, A (+ = charge)
+    int      nPacks;          // Number of packs that report now.
+    int      soc, soh;        // Aggregate SOC and SOH.
+    float    packV, current;  // Pack voltage in V and current in A. A positive current shows charge.
     int      tmin, tmax;
-    int      cclA, dclA;      // aggregate charge/discharge limits (A)
-    // per-pack SOC for the little row (index 0..nPacks-1), -1 = absent
+    int      cclA, dclA;      // Aggregate charge and discharge limits in A.
+    // Per-pack SOC for the row. Index 0 to nPacks-1. A value of -1 shows absent.
     int      packSoc[6];
     int      packAddr[6];
-    // link status
-    const char *ip;           // WiFi IP or "WiFi..."
+    // Link status.
+    const char *ip;           // WiFi IP address, or the text "WiFi...".
     bool     mqttOn, mqttOk;
-    uint32_t deyeAgeMs;       // ms since last Deye poll; UINT32_MAX = never
+    uint32_t deyeAgeMs;       // Time in ms since the last Deye poll. UINT32_MAX shows no poll yet.
 };
 void displayBank(const BankView &v);
