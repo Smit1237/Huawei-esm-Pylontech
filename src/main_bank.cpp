@@ -61,7 +61,7 @@
 // Increase this on each build. Then you can confirm the live image in the
 // WebUI header and the serial banner. This proves that an OTA push worked.
 #ifndef FW_VERSION
-#define FW_VERSION "bank-2.0"
+#define FW_VERSION "bank-2.1"
 #endif
 #ifndef ESM_TX_PIN
 #define ESM_TX_PIN 33
@@ -818,11 +818,11 @@ static String htmlPage() {
     if (xSemaphoreTake(mux, pdMS_TO_TICKS(50)) == pdTRUE) {
         a = agg; for (unsigned i = 0; i < NUM_PACKS; i++) local[i] = pk[i]; xSemaphoreGive(mux);
     }
-    String h = F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+    String h = F("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
                  "<style>body{font-family:system-ui;margin:16px;max-width:640px}"
                  "table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:4px 6px;font-size:14px;text-align:right}"
-                 "th:first-child,td:first-child{text-align:left}input{padding:4px}fieldset{margin:12px 0}"
-                 ".b{font-size:22px;font-weight:bold}</style>"
+                 "th:first-child,td:first-child{text-align:left}input{padding:4px 6px;margin:3px 0}fieldset{margin:12px 0}"
+                 ".lbl{display:inline-block;min-width:74px}.b{font-size:22px;font-weight:bold}</style>"
                  "<h2>ESM bank <span style='font-size:13px;color:#888;font-weight:normal'>fw " FW_VERSION "</span></h2>");
     if (apMode) {
         if (cfg.wifiSsid[0])
@@ -860,8 +860,8 @@ static String htmlPage() {
     h += F("</table>"
            "<form method=POST action=/save>"
            "<fieldset><legend>WiFi (NVS Persistent)</legend>"
-           "SSID <input name=wssid value='%WSSID%' maxlength=32><br>"
-           "Password <input name=wpass type=password placeholder='%WPPH%' maxlength=64 autocomplete=new-password><br>"
+           "<span class=lbl>SSID</span><input name=wssid value='%WSSID%' size=28 maxlength=32><br>"
+           "<span class=lbl>Password</span><input name=wpass type=password placeholder='%WPPH%' size=28 maxlength=64 autocomplete=new-password><br>"
            "<span style='color:#666;font-size:12px'>%WNVS%</span><br>"
            "<label style='color:#999;font-size:12px'><input type=checkbox name=wclr> forget saved WiFi (boot to setup AP)</label>"
            "</fieldset>"
@@ -891,7 +891,7 @@ static String htmlPage() {
     h.replace("%EN%", cfg.mqttEnable ? "checked" : "");
     h.replace("%HOST%", htmlEsc(cfg.host)); h.replace("%PORT%", String(cfg.port));
     h.replace("%USER%", htmlEsc(cfg.user));
-    h.replace("%MPPH%", cfg.pass[0] ? "(saved — leave blank to keep)" : "(none)");
+    h.replace("%MPPH%", cfg.pass[0] ? "(saved, blank = keep)" : "(none)");
     h.replace("%TOPIC%", htmlEsc(cfg.topic)); h.replace("%INTV%", String(cfg.interval));
     h.replace("%PP%", cfg.perPack ? "checked" : "");
     String tzOpts;
@@ -899,7 +899,7 @@ static String htmlPage() {
     h.replace("%NTP1%", htmlEsc(cfg.ntp1)); h.replace("%NTP2%", htmlEsc(cfg.ntp2)); h.replace("%NTP3%", htmlEsc(cfg.ntp3));
     h.replace("%TZ%", htmlEsc(cfg.tz)); h.replace("%NOW%", nowStr); h.replace("%TZOPTS%", tzOpts);
     h.replace("%WSSID%", htmlEsc(cfg.wifiSsid));
-    h.replace("%WPPH%", cfg.wifiPass[0] ? "(saved in NVS — leave blank to keep)" : "(password)");
+    h.replace("%WPPH%", cfg.wifiPass[0] ? "(saved in NVS, blank = keep)" : "(password)");
     String wnvs = cfg.wifiSsid[0]
         ? ("Saved in NVS: <b>" + htmlEsc(cfg.wifiSsid) + "</b> (" + (cfg.wifiPass[0] ? "password set" : "open network") + " &bull; survives OTA &amp; USB reflash)")
         : String("No WiFi saved in NVS yet");
@@ -956,8 +956,8 @@ static void handleSave() {
     if (!apMode) applyNtp();             // re-sync with the new servers and TZ immediately
     if (mqtt.connected()) mqtt.disconnect();
     if (wifiChanged) {
-        web.send(200, "text/html",
-                 "<meta http-equiv=refresh content='8;url=/'>WiFi saved to NVS &mdash; rebooting to connect. "
+        web.send(200, "text/html; charset=utf-8",
+                 "<meta charset=utf-8><meta http-equiv=refresh content='8;url=/'>WiFi saved to NVS &mdash; rebooting to connect. "
                  "If it joins your network, reopen this page at its LAN address.");
         delay(600);
         ESP.restart();
@@ -1095,7 +1095,7 @@ void setup() {
     ArduinoOTA.setPassword(OTA_PASS);
     ArduinoOTA.begin();
 
-    web.on("/", []() { web.send(200, "text/html", htmlPage()); });
+    web.on("/", []() { web.send(200, "text/html; charset=utf-8", htmlPage()); });
     web.on("/save", HTTP_POST, handleSave);
     web.on("/status", handleStatus);
     // captive portal: send any other URL to the config page (setup-AP use)
