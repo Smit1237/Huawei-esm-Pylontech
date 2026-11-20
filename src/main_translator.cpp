@@ -180,10 +180,10 @@ static void esmTask(void *) {
                 if (esm.readCells(mv, t)) {
                     local.nCells = 0;
                     for (int i = 0; i < 15; i++)
-                        if (mv[i]) local.cells[local.nCells++] = mv[i];
+                        if (mv[i] >= 500 && mv[i] <= 5000) local.cells[local.nCells++] = mv[i];
                     local.nTemps = 0;
                     for (int i = 0; i < 16 && local.nTemps < 16; i++)
-                        if (t[i] > -100 && t[i] < 200) local.ctemps[local.nTemps++] = t[i];
+                        if (t[i] >= -50 && t[i] <= 125) local.ctemps[local.nTemps++] = t[i];
                 }
                 uint32_t cyc, ah;
                 if (esm.readStats(cyc, ah))

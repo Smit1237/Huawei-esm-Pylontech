@@ -61,7 +61,7 @@
 // Increase this on each build. Then you can confirm the live image in the
 // WebUI header and the serial banner. This proves that an OTA push worked.
 #ifndef FW_VERSION
-#define FW_VERSION "bank-1.9"
+#define FW_VERSION "bank-2.0"
 #endif
 #ifndef ESM_TX_PIN
 #define ESM_TX_PIN 33
@@ -403,10 +403,11 @@ static void pollPack(Pack &p, bool deep) {
         uint16_t mv[15]; int16_t t[16];
         if (esm.readCells(mv, t)) {
             n.nCells = 0;
-            for (int i = 0; i < 15; i++) if (mv[i]) n.cells[n.nCells++] = mv[i];
+            for (int i = 0; i < 15; i++)
+                if (mv[i] >= 500 && mv[i] <= 5000) n.cells[n.nCells++] = mv[i];
             n.nTemps = 0;
             for (int i = 0; i < 16 && n.nTemps < 16; i++)
-                if (t[i] > -100 && t[i] < 200) n.ctemps[n.nTemps++] = t[i];
+                if (t[i] >= -50 && t[i] <= 125) n.ctemps[n.nTemps++] = t[i];
         }
         uint32_t cyc, ah;
         if (esm.readStats(cyc, ah)) { n.cycles = cyc > 65535 ? 65535 : (uint16_t)cyc; n.ahTotal = ah; }
@@ -427,19 +428,31 @@ static void pollPack(Pack &p, bool deep) {
 }
 
 // Combine the fresh packs into `agg`. The ESM task calls this under mux.
-// Rules for the parallel bus: average the voltage; sum the current, capacity,
-// and limits; average the SOC (all packs are 100Ah); set charge cutoff on the
-// highest cell and discharge cutoff on the lowest; take the temperature
-// extremes; a fault on any pack raises the bank fault.
+// Rules for the parallel bus:
+//   * Average terminal/pack voltage; sum parallel currents and charge/discharge limits.
+//   * SOH-weighted, properly rounded SOC across active packs; report both avg & min SOH,
+//     and both avg & max cycle counts.
+//   * Report true global max/min cell voltage across all 60 cells (with exact pack+cell
+//     position) for OV/UV protection, while tracking within-pack spread for cell imbalance.
+//   * Compute true arithmetic mean across all valid NTC sensors (all 60 thermistors).
 static void aggregate() {
     static bool bankFullLatched = false;
     uint32_t now = millis();
     int n = 0, nWithLimits = 0;
     bool allFull = true;
-    float sumV = 0, sumI = 0; uint32_t sumSoc = 0; int minSoh = 100;
-    uint16_t bankMaxCell = 0, bankMinCell = 0xFFFF;
+    float sumV = 0, sumBusV = 0, sumI = 0;
+    uint32_t weightedSocNum = 0, weightedSocDen = 0;
+    uint32_t sumSoh = 0, sumCyc = 0;
+    int minSoh = 100;
+    uint16_t maxCyc = 0;
+    uint16_t bankMaxCell = 0, bankMinCell = 0xFFFF, bankMaxSpread = 0;
+    uint8_t  maxCellPack = 1, maxCellIdx = 1, minCellPack = 1, minCellIdx = 1;
     int16_t  bankMaxT = -128, bankMinT = 127;
-    uint32_t sumCcl = 0, sumDcl = 0; uint16_t maxCyc = 0;
+    int16_t  bankMaxSensorT = -128, bankMinSensorT = 127;
+    uint8_t  maxTempPack = 1, maxTempIdx = 1, minTempPack = 1, minTempIdx = 1;
+    int32_t  sumCellT = 0;
+    uint32_t cntCellT = 0;
+    uint32_t sumCcl = 0, sumDcl = 0;
     uint16_t cvl = 0, dvl = 0;
     uint16_t orSysF = 0, orCellF = 0, orProt = 0, orWarn = 0, orSpec = 0;
 
@@ -448,11 +461,22 @@ static void aggregate() {
         if (!p.s.valid || now - p.s.ts > STALE_MS) continue;
         n++;
         if (p.s.soc < 100) allFull = false;
-        sumV += p.s.packV; sumI += p.s.current; sumSoc += p.s.soc;
+        sumV += p.s.packV;
+        sumBusV += p.s.busV;
+        sumI += p.s.current;
+
+        uint32_t w = p.s.soh > 0 ? p.s.soh : 100;
+        weightedSocNum += (uint32_t)p.s.soc * w;
+        weightedSocDen += w;
+
+        sumSoh += p.s.soh;
         if (p.s.soh < minSoh) minSoh = p.s.soh;
+
+        sumCyc += p.s.cycles;
+        if (maxCyc < p.s.cycles) maxCyc = p.s.cycles;
+
         bankMaxT = max<int16_t>(bankMaxT, p.s.tmax);
         bankMinT = min<int16_t>(bankMinT, p.s.tmin);
-        if (maxCyc < p.s.cycles) maxCyc = p.s.cycles;
 
         orSysF  |= p.s.sysFault;
         orCellF |= p.s.cellFault;
@@ -462,10 +486,23 @@ static void aggregate() {
 
         uint16_t pMaxC = 0, pMinC = 0xFFFF;
         for (uint8_t c = 0; c < p.s.nCells; c++) {
-            if (p.s.cells[c] > bankMaxCell) bankMaxCell = p.s.cells[c];
-            if (p.s.cells[c] < bankMinCell) bankMinCell = p.s.cells[c];
-            if (p.s.cells[c] > pMaxC) pMaxC = p.s.cells[c];
-            if (p.s.cells[c] < pMinC) pMinC = p.s.cells[c];
+            uint16_t mv = p.s.cells[c];
+            if (mv > bankMaxCell) { bankMaxCell = mv; maxCellPack = i + 1; maxCellIdx = c + 1; }
+            if (mv < bankMinCell) { bankMinCell = mv; minCellPack = i + 1; minCellIdx = c + 1; }
+            if (mv > pMaxC) pMaxC = mv;
+            if (mv < pMinC) pMinC = mv;
+        }
+        if (p.s.nCells >= 2 && pMaxC >= pMinC) {
+            uint16_t sp = pMaxC - pMinC;
+            if (sp > bankMaxSpread) bankMaxSpread = sp;
+        }
+
+        for (uint8_t t = 0; t < p.s.nTemps; t++) {
+            int16_t tc = p.s.ctemps[t];
+            sumCellT += tc;
+            cntCellT++;
+            if (tc > bankMaxSensorT) { bankMaxSensorT = tc; maxTempPack = i + 1; maxTempIdx = t + 1; }
+            if (tc < bankMinSensorT) { bankMinSensorT = tc; minTempPack = i + 1; minTempIdx = t + 1; }
         }
 
         if (p.s.haveLimits) {
@@ -502,7 +539,15 @@ static void aggregate() {
     PackSnapshot a;
     a.valid = (n > 0);
     if (n > 0) {
-        uint8_t avgSoc = (uint8_t)(sumSoc / n);
+        uint8_t  avgSoc = weightedSocDen ? (uint8_t)((weightedSocNum + weightedSocDen / 2) / weightedSocDen) : 0;
+        uint8_t  avgSoh = (uint8_t)((sumSoh + (uint32_t)n / 2) / (uint32_t)n);
+        uint16_t avgCyc = (uint16_t)((sumCyc + (uint32_t)n / 2) / (uint32_t)n);
+
+        if (cntCellT > 0) {
+            bankMaxT = max<int16_t>(bankMaxT, bankMaxSensorT);
+            bankMinT = min<int16_t>(bankMinT, bankMinSensorT);
+        }
+
         // Clean full-charge hysteresis latch:
         // Latch fullStop when every active pack is 100% SOC, current has tapered near 0, and cells >= 3.38V
         if (allFull && fabsf(sumI) <= 0.4f && (bankMinCell == 0xFFFF || bankMinCell >= 3380)) {
@@ -515,14 +560,30 @@ static void aggregate() {
         a.haveLimits = (nWithLimits > 0);
         a.fullStop = bankFullLatched;
         a.packV = sumV / n;
+        a.busV = sumBusV / n;
         a.current = sumI;
         a.soc = avgSoc;
-        a.soh = minSoh;
-        a.tmin = bankMinT; a.tmax = bankMaxT;
-        a.nTemps = 0;                                // emulator uses tmin/tmax
+        a.soh = avgSoh;
+        a.sohMin = (uint8_t)minSoh;
+        a.tmin = bankMinT;
+        a.tmax = bankMaxT;
+        a.tavg = cntCellT > 0 ? ((float)sumCellT / (float)cntCellT) : ((bankMinT + bankMaxT) * 0.5f);
+        a.nTemps = 0;
+        a.maxTempPack = maxTempPack; a.maxTempIdx = maxTempIdx;
+        a.minTempPack = minTempPack; a.minTempIdx = minTempIdx;
         a.cycles = maxCyc;
-        if (bankMaxCell) { a.cells[0] = bankMaxCell; a.cells[1] = bankMinCell; a.nCells = 2; }
-        else a.nCells = 0;
+        a.cyclesAvg = avgCyc;
+        if (bankMaxCell && bankMinCell != 0xFFFF) {
+            a.cells[0] = bankMaxCell;
+            a.cells[1] = bankMinCell;
+            a.nCells = 2;
+            a.maxSpread = bankMaxSpread;
+            a.maxCellPack = maxCellPack; a.maxCellIdx = maxCellIdx;
+            a.minCellPack = minCellPack; a.minCellIdx = minCellIdx;
+        } else {
+            a.nCells = 0;
+            a.maxSpread = 0;
+        }
         a.cvl_raw = cvl; a.dvl_raw = dvl;
         a.ccl_raw = sumCcl > 65535 ? 65535 : sumCcl;
         a.dcl_raw = sumDcl > 65535 ? 65535 : sumDcl;
@@ -594,10 +655,14 @@ static void mqttPublish() {
 
     // aggregate
     if (a.valid) {
+        float tavgVal = !isnan(a.tavg) ? a.tavg : ((a.tmin + a.tmax) * 0.5f);
         snprintf(buf, sizeof(buf),
-                 "{\"soc\":%d,\"v\":%.2f,\"i\":%.2f,\"soh\":%d,\"tmin\":%d,\"tmax\":%d,"
-                 "\"cycles\":%u,\"ccl\":%.1f,\"dcl\":%.1f,\"packs\":%d,\"ts\":%u}",
-                 a.soc, a.packV, a.current, a.soh, a.tmin, a.tmax, a.cycles,
+                 "{\"soc\":%d,\"v\":%.2f,\"busv\":%.2f,\"i\":%.2f,\"soh\":%d,\"soh_min\":%d,"
+                 "\"tavg\":%.1f,\"tmin\":%d,\"tmax\":%d,\"cycles_avg\":%u,\"cycles\":%u,"
+                 "\"spread_max\":%u,\"ccl\":%.1f,\"dcl\":%.1f,\"packs\":%d,\"ts\":%u}",
+                 a.soc, a.packV, a.busV, a.current, a.soh, a.sohMin ? a.sohMin : a.soh,
+                 tavgVal, a.tmin, a.tmax, a.cyclesAvg ? a.cyclesAvg : a.cycles, a.cycles,
+                 a.maxSpread == 0xFFFF ? 0 : a.maxSpread,
                  a.ccl_raw / 10.0, a.dcl_raw / 10.0, nfresh, ts);
         snprintf(topic, sizeof(topic), "%s/bank", cfg.topic);
         mqtt.publish(topic, buf);
@@ -772,10 +837,12 @@ static String htmlPage() {
              + WiFi.localIP().toString() + " &nbsp; <span style='color:#666'>(saved in NVS)</span></p>";
     }
     if (a.valid) {
+        float tavgVal = !isnan(a.tavg) ? a.tavg : ((a.tmin + a.tmax) * 0.5f);
         h += "<p class=b>" + String(a.soc) + "% &nbsp; " + String(a.packV, 1) + " V &nbsp; "
              + String(a.current, 1) + " A</p>";
-        h += "<p>SOH " + String(a.soh) + "% &nbsp; " + String(a.tmin) + ".." + String(a.tmax)
-             + " C &nbsp; CCL " + String(a.ccl_raw / 10.0, 1) + " A &nbsp; DCL "
+        h += "<p>SOH " + String(a.soh) + "% (min " + String(a.sohMin ? a.sohMin : a.soh) + "%) &nbsp; "
+             + String(tavgVal, 1) + " C (" + String(a.tmin) + ".." + String(a.tmax)
+             + " C) &nbsp; CCL " + String(a.ccl_raw / 10.0, 1) + " A &nbsp; DCL "
              + String(a.dcl_raw / 10.0, 1) + " A</p>";
     } else h += "<p>reading packs...</p>";
     h += F("<table><tr><th>Pack</th><th>Serial</th><th>SOC</th><th>V</th><th>A</th><th>SOH</th><th>Temp</th></tr>");
@@ -921,10 +988,18 @@ static void handleStatus() {
     j += ",\"time\":{\"epoch\":" + String(ep) + ",\"synced\":" + String(ep ? 1 : 0) +
          ",\"local\":\"" + String(localStr) + "\",\"tz\":\"" + String(cfg.tz) +
          "\",\"posix\":\"" + String(tzToPosix(cfg.tz)) + "\",\"ntp\":\"" + String(cfg.ntp1) + "\"}";
+    float tavgVal = !isnan(a.tavg) ? a.tavg : ((a.tmin + a.tmax) * 0.5f);
     j += ",\"agg\":{\"valid\":" + String(a.valid ? 1 : 0) +
          ",\"soc\":" + String(a.soc) + ",\"v\":" + String(a.packV, 2) +
-         ",\"i\":" + String(a.current, 2) + ",\"soh\":" + String(a.soh) +
+         ",\"busv\":" + String(a.busV, 2) +
+         ",\"i\":" + String(a.current, 2) +
+         ",\"soh\":" + String(a.soh) + ",\"soh_min\":" + String(a.sohMin ? a.sohMin : a.soh) +
+         ",\"tavg\":" + String(tavgVal, 2) +
          ",\"tmin\":" + String(a.tmin) + ",\"tmax\":" + String(a.tmax) +
+         ",\"cyc_avg\":" + String(a.cyclesAvg ? a.cyclesAvg : a.cycles) + ",\"cyc_max\":" + String(a.cycles) +
+         ",\"cellmax\":" + String(a.nCells ? a.cells[0] : 0) +
+         ",\"cellmin\":" + String(a.nCells >= 2 ? a.cells[1] : 0) +
+         ",\"spread_max\":" + String(a.maxSpread == 0xFFFF ? 0 : a.maxSpread) +
          ",\"ccl\":" + String(a.ccl_raw / 10.0, 1) + ",\"dcl\":" + String(a.dcl_raw / 10.0, 1) +
          ",\"cvl\":" + String(a.cvl_raw / 10.0, 1) + ",\"dvl\":" + String(a.dvl_raw / 10.0, 1) +
          ",\"age\":" + String(a.valid ? now - a.ts : 0) + "}";

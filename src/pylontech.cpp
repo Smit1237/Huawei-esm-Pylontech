@@ -13,23 +13,30 @@ static void lengthField(uint16_t infoLen, char out[5]) {
     snprintf(out, 5, "%1X%03X", (unsigned)(lchk & 0xF), (unsigned)(infoLen & 0xFFF));
 }
 
-// deci-Kelvin is the Pylontech temperature unit.
+// Pylontech RS485 temperature unit: 0.1 K where 0.0 degC = 2731 (273.1 K).
 static uint16_t deciK(float celsius) {
-    return (uint16_t)lroundf((celsius + 273.15f) * 10.0f);
+    int32_t dk = (int32_t)lroundf(celsius * 10.0f) + 2731;
+    if (dk < 0)     dk = 0;
+    if (dk > 65535) dk = 65535;
+    return (uint16_t)dk;
 }
 
-static void cellExtremes(const PackSnapshot &s, uint16_t &maxc, uint16_t &minc) {
+static void cellExtremes(const PackSnapshot &s, uint16_t &maxc, uint16_t &minc,
+                         uint8_t *maxIdxOut = nullptr, uint8_t *minIdxOut = nullptr) {
     maxc = 3350;
     minc = 3350;
+    uint8_t hiIdx = 1, loIdx = 1;
     if (s.nCells) {
         maxc = 0;
         minc = 0xFFFF;
         for (uint8_t i = 0; i < s.nCells; i++) {
-            if (s.cells[i] > maxc) maxc = s.cells[i];
-            if (s.cells[i] < minc) minc = s.cells[i];
+            if (s.cells[i] > maxc) { maxc = s.cells[i]; hiIdx = i + 1; }
+            if (s.cells[i] < minc) { minc = s.cells[i]; loIdx = i + 1; }
         }
         if (minc == 0xFFFF) minc = 3350;
     }
+    if (maxIdxOut) *maxIdxOut = s.maxCellIdx ? s.maxCellIdx : hiIdx;
+    if (minIdxOut) *minIdxOut = s.minCellIdx ? s.minCellIdx : loIdx;
 }
 
 void PylontechEmu::sendFrame(const char *info) {
@@ -65,42 +72,64 @@ void PylontechEmu::buildCmd61(const PackSnapshot &s, char *out, size_t n) {
     if (raw_ca < -32768) raw_ca = -32768;
     uint16_t i_ca = (uint16_t)(raw_ca & 0xFFFF);
 
-    uint8_t  soc  = s.soc;
-    uint8_t  soh  = s.soh;
-    uint16_t cyc  = s.cycles ? s.cycles : 100;
+    uint8_t  soc    = s.soc;
+    uint8_t  avgSoh = s.soh;
+    uint8_t  minSoh = s.sohMin ? s.sohMin : avgSoh;
+    uint16_t maxCyc = s.cycles ? s.cycles : 100;
+    uint16_t avgCyc = s.cyclesAvg ? s.cyclesAvg : maxCyc;
 
     uint16_t maxc, minc;
-    cellExtremes(s, maxc, minc);
+    uint8_t  maxCIdx = 1, minCIdx = 1;
+    cellExtremes(s, maxc, minc, &maxCIdx, &minCIdx);
+    uint8_t maxCPack = s.maxCellPack ? s.maxCellPack : 1;
+    uint8_t minCPack = s.minCellPack ? s.minCellPack : 1;
 
-    uint16_t tavg = deciK((s.tmin + s.tmax) / 2.0f);
-    uint16_t tmaxK, tminK;
+    uint16_t tavgK, tmaxK, tminK;
+    uint8_t  maxTPack = s.maxTempPack ? s.maxTempPack : 1;
+    uint8_t  minTPack = s.minTempPack ? s.minTempPack : 1;
+    uint8_t  maxTIdx  = s.maxTempIdx  ? s.maxTempIdx  : 1;
+    uint8_t  minTIdx  = s.minTempIdx  ? s.minTempIdx  : 1;
+
     if (s.nTemps) {
         int16_t hi = s.ctemps[0], lo = s.ctemps[0];
+        int32_t sumT = s.ctemps[0];
+        uint8_t hiI = 1, loI = 1;
         for (uint8_t i = 1; i < s.nTemps; i++) {
-            if (s.ctemps[i] > hi) hi = s.ctemps[i];
-            if (s.ctemps[i] < lo) lo = s.ctemps[i];
+            sumT += s.ctemps[i];
+            if (s.ctemps[i] > hi) { hi = s.ctemps[i]; hiI = i + 1; }
+            if (s.ctemps[i] < lo) { lo = s.ctemps[i]; loI = i + 1; }
         }
-        tmaxK = deciK(hi); tminK = deciK(lo);
+        float meanC = !isnan(s.tavg) ? s.tavg : ((float)sumT / (float)s.nTemps);
+        tavgK = deciK(meanC);
+        tmaxK = deciK(hi);
+        tminK = deciK(lo);
+        if (!s.maxTempIdx) maxTIdx = hiI;
+        if (!s.minTempIdx) minTIdx = loI;
     } else {
-        tmaxK = deciK(s.tmax); tminK = deciK(s.tmin);
+        float meanC = !isnan(s.tavg) ? s.tavg : ((s.tmin + s.tmax) * 0.5f);
+        tavgK = deciK(meanC);
+        tmaxK = deciK(s.tmax);
+        tminK = deciK(s.tmin);
     }
 
     snprintf(out, n,
              "%04X%04X%02X%04X%04X%02X%02X"
-             "%04X0101%04X0108"
-             "%04X%04X0103%04X0109"
+             "%04X%02X%02X%04X%02X%02X"
+             "%04X%04X%02X%02X%04X%02X%02X"
              "%04X%04X0101%04X0101"
              "%04X%04X0101%04X0101",
-             v_mv, i_ca, soc, cyc, cyc, soh, soh,
-             maxc, minc,
-             tavg, tmaxK, tminK,
-             tavg, tavg, tavg,
-             tavg, tavg, tavg);
+             v_mv, i_ca, soc, avgCyc, maxCyc, avgSoh, minSoh,
+             maxc, maxCPack, maxCIdx, minc, minCPack, minCIdx,
+             tavgK, tmaxK, maxTPack, maxTIdx, tminK, minTPack, minTIdx,
+             tavgK, tavgK, tavgK,
+             tavgK, tavgK, tavgK);
 }
 
 void PylontechEmu::buildCmd62(const PackSnapshot &s, char *out, size_t n) {
     uint16_t maxc, minc;
     cellExtremes(s, maxc, minc);
+    uint16_t spread = (s.maxSpread != 0xFFFF) ? s.maxSpread
+                    : ((s.nCells >= 2 && maxc >= minc) ? (maxc - minc) : 0);
 
     uint8_t alarm1 = 0, alarm2 = 0, prot1 = 0, prot2 = 0;
 
@@ -111,7 +140,7 @@ void PylontechEmu::buildCmd62(const PackSnapshot &s, char *out, size_t n) {
     if (s.nCells && minc <= 2950)                       alarm1 |= (1 << 4); // Cell V Low
     if (s.tmax >= 50)                                   alarm1 |= (1 << 3); // Cell Temp High
     if (s.tmin <= 2)                                    alarm1 |= (1 << 2); // Cell Temp Low
-    if (s.nCells >= 2 && (maxc - minc) >= 300)          alarm1 |= (1 << 0); // Cell Imbalance >= 300mV
+    if (spread >= 300)                                  alarm1 |= (1 << 0); // Within-pack Cell Imbalance >= 300mV
 
     // Alarm Status 2
     if (s.warn != 0)                                    alarm2 |= (1 << 3); // Pack warning active

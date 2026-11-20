@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <math.h>
 
 // Pylontech RS485 (YDN1363) battery emulator for the Deye BMS port,
 // "Lithium mode 12". The emulator answers the inverter polls
@@ -11,15 +12,23 @@ struct PackSnapshot {
     bool     fullStop   = false; // hysteresis latch when 100% full & idle
     float    packV      = 0;     // V
     float    current    = 0;     // A, + = charge (ESM native sign)
-    uint8_t  soc        = 0;
-    uint8_t  soh        = 0;
+    uint8_t  soc        = 0;     // % (SOH-weighted rounded average in bank mode)
+    uint8_t  soh        = 0;     // % (average SOH in bank mode)
+    uint8_t  sohMin     = 0;     // % (minimum pack SOH; 0 = same as soh)
     int16_t  tmin       = 0;     // degC
     int16_t  tmax       = 0;     // degC
+    float    tavg       = NAN;   // degC true mean across all NTCs (NAN = compute from ctemps[])
     uint16_t cells[15];          // mV
     uint8_t  nCells     = 0;
-    int16_t  ctemps[16];         // degC (all 16 Huawei NTC sensors)
+    uint16_t maxSpread  = 0xFFFF;// max within-pack cell delta in mV (0xFFFF = compute from cells[])
+    uint8_t  maxCellPack = 1, maxCellIdx = 0; // 1-based Pylontech coordinates
+    uint8_t  minCellPack = 1, minCellIdx = 0;
+    uint8_t  maxTempPack = 1, maxTempIdx = 0;
+    uint8_t  minTempPack = 1, minTempIdx = 0;
+    int16_t  ctemps[16];         // degC (Huawei NTC sensors)
     uint8_t  nTemps     = 0;
-    uint16_t cycles     = 0;
+    uint16_t cycles     = 0;     // max cycles
+    uint16_t cyclesAvg  = 0;     // average cycles (0 = same as cycles)
     // Raw limit registers of the pack (0x100A block)
     uint16_t cvl_raw    = 0;     // 0.1 V  charge voltage
     uint16_t dvl_raw    = 0;     // 0.1 V  discharge cutoff
