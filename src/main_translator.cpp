@@ -182,24 +182,34 @@ static void esmTask(void *) {
                     for (int i = 0; i < 15; i++)
                         if (mv[i]) local.cells[local.nCells++] = mv[i];
                     local.nTemps = 0;
-                    for (int i = 0; i < 15 && local.nTemps < 15; i++)
+                    for (int i = 0; i < 16 && local.nTemps < 16; i++)
                         if (t[i] > -100 && t[i] < 200) local.ctemps[local.nTemps++] = t[i];
                 }
                 uint32_t cyc, ah;
                 if (esm.readStats(cyc, ah))
                     local.cycles = cyc > 65535 ? 65535 : (uint16_t)cyc;
 
-                // limit registers 0x100A..0x1018 — indices from esm_web.py
+                // limit registers 0x100A..0x1018
                 uint16_t lim[15];
                 if (esm.readRegisters(0x100A, 15, lim)) {
-                    local.cvl_raw  = lim[0];    // 0.1 V charge voltage
-                    local.dcl_raw  = lim[1];    // 0.1 A discharge current
-                    local.ccl_raw  = lim[3];    // 0.1 A charge current
-                    local.dvl_raw  = lim[4];    // 0.1 V discharge cutoff
-                    local.ccl_coef = lim[7];    // %  0x1011
-                    local.dcl_coef = lim[14];   // %  0x1018
+                    local.cvl_raw    = lim[0];    // 0.1 V charge voltage
+                    local.dcl_raw    = lim[1];    // 0.1 A discharge current
+                    local.ccl_raw    = lim[3];    // 0.1 A charge current
+                    local.dvl_raw    = lim[4];    // 0.1 V discharge cutoff
+                    local.ccl_coef   = lim[7];    // %  0x1011
+                    local.dcl_coef   = lim[14];   // %  0x1018
+                    local.haveLimits = true;
+                }
+                EsmStatusBits sb;
+                if (esm.readStatusBits(sb)) {
+                    local.sysFault = sb.systemFaults; local.cellFault = sb.cellFaults;
+                    local.prot = sb.activeProtections; local.warn = sb.activeWarnings;
+                    local.special = sb.specialStates;
                 }
             }
+
+            if (local.soc == 100 && fabsf(local.current) <= 0.3f) local.fullStop = true;
+            else if (local.soc <= 98 || local.current < -0.6f)    local.fullStop = false;
 
             local.valid = true;
             local.ts    = millis();

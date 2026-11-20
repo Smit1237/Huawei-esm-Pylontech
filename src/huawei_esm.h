@@ -98,6 +98,7 @@ private:
 
     HardwareSerial &_port;
     int8_t   _rxPin, _txPin;
-    uint8_t  _addr   = 217;
-    uint32_t _parity = SERIAL_8N1;
+    uint8_t  _addr    = 217;
+    uint32_t _parity  = SERIAL_8N1;
+    bool     _started = false;
 };

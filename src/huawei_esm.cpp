@@ -24,13 +24,17 @@ HuaweiESM::HuaweiESM(HardwareSerial &port, int8_t rxPin, int8_t txPin)
 
 void HuaweiESM::setTarget(uint8_t addr, bool evenParity) {
     _addr = addr;
-    reconfigureSerial(evenParity ? SERIAL_8E1 : SERIAL_8N1);
+    uint32_t wanted = evenParity ? SERIAL_8E1 : SERIAL_8N1;
+    if (!_started || _parity != wanted) {
+        reconfigureSerial(wanted);
+    }
 }
 
 void HuaweiESM::reconfigureSerial(uint32_t parityMode) {
     _parity = parityMode;
-    _port.end();
+    if (_started) _port.end();
     _port.begin(ESM_BAUD, _parity, _rxPin, _txPin);
+    _started = true;
 }
 
 uint16_t HuaweiESM::crc16(const uint8_t *data, size_t len) {

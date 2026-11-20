@@ -1,7 +1,5 @@
 #include "pylontech.h"
 
-// ---- YDN1363 framing. This is the same as deye_bms.py. ----
-
 static uint16_t chksum(const char *body, size_t n) {
     uint32_t s = 0;
     for (size_t i = 0; i < n; i++) s += (uint8_t)body[i];
@@ -20,6 +18,20 @@ static uint16_t deciK(float celsius) {
     return (uint16_t)lroundf((celsius + 273.15f) * 10.0f);
 }
 
+static void cellExtremes(const PackSnapshot &s, uint16_t &maxc, uint16_t &minc) {
+    maxc = 3350;
+    minc = 3350;
+    if (s.nCells) {
+        maxc = 0;
+        minc = 0xFFFF;
+        for (uint8_t i = 0; i < s.nCells; i++) {
+            if (s.cells[i] > maxc) maxc = s.cells[i];
+            if (s.cells[i] < minc) minc = s.cells[i];
+        }
+        if (minc == 0xFFFF) minc = 3350;
+    }
+}
+
 void PylontechEmu::sendFrame(const char *info) {
     char body[512];
     char lf[5];
@@ -32,31 +44,33 @@ void PylontechEmu::sendFrame(const char *info) {
     char out[540];
     int on = snprintf(out, sizeof(out), "~%s%04X\r", body, chksum(body, (size_t)bn));
     if (on <= 0 || (size_t)on >= sizeof(out)) return;
+
+    // Wait 2 ms (~2 char times @ 9600 baud) so Deye's RS485 transceiver releases TX
+    delay(2);
     _port.write((const uint8_t *)out, (size_t)on);
     _port.flush();
     answered++;
 #ifdef BUS_DEBUG
     Serial.print("[DEYE TX] ");
-    Serial.write((const uint8_t *)out, (size_t)on - 1);   // Remove the last CR character.
+    Serial.write((const uint8_t *)out, (size_t)on - 1);
     Serial.println();
 #endif
 }
 
 void PylontechEmu::buildCmd61(const PackSnapshot &s, char *out, size_t n) {
     uint16_t v_mv = (uint16_t)lroundf(s.packV * 1000.0f);
-    uint16_t i_ca = (uint16_t)(((int32_t)lroundf(s.current * 100.0f)) & 0xFFFF);
+    // Clamp centi-amps to int16_t range [-32768, +32767] so >327.67 A never wraps sign
+    int32_t raw_ca = (int32_t)lroundf(s.current * 100.0f);
+    if (raw_ca > 32767)  raw_ca = 32767;
+    if (raw_ca < -32768) raw_ca = -32768;
+    uint16_t i_ca = (uint16_t)(raw_ca & 0xFFFF);
+
     uint8_t  soc  = s.soc;
     uint8_t  soh  = s.soh;
     uint16_t cyc  = s.cycles ? s.cycles : 100;
 
-    uint16_t maxc = 3350, minc = 3350;
-    if (s.nCells) {
-        maxc = 0; minc = 0xFFFF;
-        for (uint8_t i = 0; i < s.nCells; i++) {
-            if (s.cells[i] > maxc) maxc = s.cells[i];
-            if (s.cells[i] < minc) minc = s.cells[i];
-        }
-    }
+    uint16_t maxc, minc;
+    cellExtremes(s, maxc, minc);
 
     uint16_t tavg = deciK((s.tmin + s.tmax) / 2.0f);
     uint16_t tmaxK, tminK;
@@ -71,9 +85,6 @@ void PylontechEmu::buildCmd61(const PackSnapshot &s, char *out, size_t n) {
         tmaxK = deciK(s.tmax); tminK = deciK(s.tmin);
     }
 
-    // The 0101/0108/0103/0109 markers are fixed protocol constants. You
-    // cannot address the Deye per-cell page through 0x61, which is a
-    // summary-only format. A test confirms this. Keep the reference values.
     snprintf(out, n,
              "%04X%04X%02X%04X%04X%02X%02X"
              "%04X0101%04X0108"
@@ -88,65 +99,139 @@ void PylontechEmu::buildCmd61(const PackSnapshot &s, char *out, size_t n) {
 }
 
 void PylontechEmu::buildCmd62(const PackSnapshot &s, char *out, size_t n) {
-    (void)s;
-    // Report all-normal unless the pack shows a fault. Keep this simple and safe.
-    snprintf(out, n, "00000000");
+    uint16_t maxc, minc;
+    cellExtremes(s, maxc, minc);
+
+    uint8_t alarm1 = 0, alarm2 = 0, prot1 = 0, prot2 = 0;
+
+    // Alarm Status 1 (matches Pylontech 0x62 layout)
+    if (s.packV >= 55.5f)                               alarm1 |= (1 << 7); // Total V High
+    if (s.packV > 10.0f && s.packV <= 47.5f)            alarm1 |= (1 << 6); // Total V Low
+    if (s.nCells && maxc >= 3600)                       alarm1 |= (1 << 5); // Cell V High
+    if (s.nCells && minc <= 2950)                       alarm1 |= (1 << 4); // Cell V Low
+    if (s.tmax >= 50)                                   alarm1 |= (1 << 3); // Cell Temp High
+    if (s.tmin <= 2)                                    alarm1 |= (1 << 2); // Cell Temp Low
+    if (s.nCells >= 2 && (maxc - minc) >= 300)          alarm1 |= (1 << 0); // Cell Imbalance >= 300mV
+
+    // Alarm Status 2
+    if (s.warn != 0)                                    alarm2 |= (1 << 3); // Pack warning active
+
+    // Protection Status 1
+    if (s.packV >= 56.5f)                               prot1  |= (1 << 7); // Module OV Prot
+    if (s.packV > 10.0f && s.packV <= 45.0f)            prot1  |= (1 << 6); // Module UV Prot
+    if (s.nCells && maxc >= 3650)                       prot1  |= (1 << 5); // Cell OV Prot
+    if (s.nCells && minc <= 2800)                       prot1  |= (1 << 4); // Cell UV Prot
+    if (s.tmax >= 55)                                   prot1  |= (1 << 3); // Cell OT Prot
+    if (s.tmin <= -5)                                   prot1  |= (1 << 2); // Cell UT Prot
+
+    // Protection Status 2
+    if ((s.sysFault | s.cellFault | s.prot) != 0)       prot2  |= (1 << 3); // Hardware / BMS Fault
+
+    snprintf(out, n, "%02X%02X%02X%02X", alarm1, alarm2, prot1, prot2);
 }
 
 void PylontechEmu::buildCmd63(const PackSnapshot &s, char *out, size_t n) {
-    const uint8_t status = 0xC0;   // bit7 is charge enable. bit6 is discharge enable.
-    // Forward the limit registers of the battery. ESM voltage registers are
-    // 0.1 V. Multiply by 100 to get mV. Current registers are already 0.1 A,
-    // which is the Deye deci-amp unit, so they pass through (e.g. 693 -> 69.3 A).
+    uint16_t maxc, minc;
+    cellExtremes(s, maxc, minc);
+
     uint32_t cvl_mv = (uint32_t)(s.cvl_raw ? s.cvl_raw : 540) * 100;
     uint32_t dvl_mv = (uint32_t)(s.dvl_raw ? s.dvl_raw : 475) * 100;
-    uint32_t ccl_da = s.ccl_raw ? s.ccl_raw : 500;
-    uint32_t dcl_da = s.dcl_raw ? s.dcl_raw : 500;
-    // Apply the charge and discharge limit coefficient of the pack (%,
-    // registers 0x1011 / 0x1018): e.g. 693 * 85% = 589 -> 58.9 A.
-    if (s.ccl_coef) ccl_da = ccl_da * s.ccl_coef / 100;
-    if (s.dcl_coef) dcl_da = dcl_da * s.dcl_coef / 100;
+    uint32_t ccl_da = s.haveLimits ? s.ccl_raw : 0;
+    uint32_t dcl_da = s.haveLimits ? s.dcl_raw : 0;
+
+    // Apply Huawei NVRAM coef when configured (1..100%); 0 in Huawei 0x1011 means unconfigured
+    uint16_t cclC = s.ccl_coef > 100 ? 100 : s.ccl_coef;
+    uint16_t dclC = s.dcl_coef > 100 ? 100 : s.dcl_coef;
+    if (cclC > 0) ccl_da = ccl_da * cclC / 100;
+    if (dclC > 0) dcl_da = dcl_da * dclC / 100;
+
+    // LiFePO4 cell-voltage & temperature protection envelopes
+    bool hardFault = (s.sysFault | s.cellFault | s.prot) != 0;
+    if (hardFault || s.tmax >= 55 || s.tmin <= 0 || (s.nCells && maxc >= 3620) || s.fullStop) {
+        ccl_da = 0;
+    } else {
+        // Cold temperature charge derate
+        if (s.tmin <= 5 && ccl_da > 100)       ccl_da = 100; // <=5C: max 10A
+        else if (s.tmin <= 12 && ccl_da > 300) ccl_da = 300; // <=12C: max 30A
+        // High cell voltage top-of-charge taper (15S LiFePO4)
+        if (s.nCells && maxc >= 3550 && ccl_da > 50)       ccl_da = 50;  // >=3.55V: 5A balance taper
+        else if (s.nCells && maxc >= 3500 && ccl_da > 150) ccl_da = 150; // >=3.50V: 15A taper
+    }
+
+    if ((s.sysFault | s.cellFault) != 0 || s.tmax >= 58 || (s.nCells && minc <= 2800)) {
+        dcl_da = 0;
+    }
+
+    // Dynamic Pylontech 0x63 management flags:
+    // bit7 = Charge Enable, bit6 = Discharge Enable, bit5 = Force Charge Request
+    uint8_t status = 0;
+    if (ccl_da > 0) status |= 0x80;
+    if (dcl_da > 0) status |= 0x40;
+    if (s.soc <= 5 || (s.nCells && minc <= 2950)) status |= 0x20;
+
     snprintf(out, n, "%04X%04X%04X%04X%02X",
              (unsigned)(cvl_mv & 0xFFFF), (unsigned)(dvl_mv & 0xFFFF),
              (unsigned)(ccl_da & 0xFFFF), (unsigned)(dcl_da & 0xFFFF), status);
 }
 
+static int hexByte(char hi, char lo) {
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return -1;
+    };
+    int h = nib(hi), l = nib(lo);
+    return (h < 0 || l < 0) ? -1 : ((h << 4) | l);
+}
+
 void PylontechEmu::poll(const PackSnapshot &s) {
     while (_port.available()) {
         char c = (char)_port.read();
-        if (c == '\r') {
-            // The complete frame is in _buf[0.._len).
-            if (_len >= 9 && _buf[0] == '~') {
+        if (c == '~') {
+            // Always resync frame start on '~' so any RS485 turnaround glitch byte before '~' is discarded!
+            _len = 0;
+            _buf[_len++] = '~';
+        } else if (c == '\r') {
+            // Minimum valid Pylontech request: '~' + 12 body chars (VER,ADR,CID1,CID2,LEN) + 4 CHKSUM chars = 17 chars
+            if (_len >= 17 && _buf[0] == '~') {
 #ifdef BUS_DEBUG
                 _buf[_len] = 0;
                 Serial.print("[DEYE RX] "); Serial.println(_buf);
 #endif
-                const char *b = _buf + 1;          // Skip the '~' character.
-                char tmp[3] = { 0, 0, 0 };
-                tmp[0] = b[2]; tmp[1] = b[3];
-                uint8_t adr = (uint8_t)strtol(tmp, nullptr, 16);
-                tmp[0] = b[4]; tmp[1] = b[5];
-                uint8_t cid1 = (uint8_t)strtol(tmp, nullptr, 16);
-                char cid2[3] = { b[6], b[7], 0 };
+                const char *b = _buf + 1;           // Skip '~'
+                size_t bodyLen = _len - 5;          // Exclude '~' and 4-char trailing checksum
+                int chkHi = hexByte(_buf[_len - 4], _buf[_len - 3]);
+                int chkLo = hexByte(_buf[_len - 2], _buf[_len - 1]);
+                uint16_t expectedChk = chksum(b, bodyLen);
 
-                if (adr == _addr && cid1 == 0x46) {
-                    lastPollMs = millis();
-                    strncpy(lastCid2, cid2, sizeof(lastCid2));
-                    if (s.valid) {
-                        char info[320];
-                        bool ok = true;
-                        if (!strcmp(cid2, "61"))      buildCmd61(s, info, sizeof(info));
-                        else if (!strcmp(cid2, "62")) buildCmd62(s, info, sizeof(info));
-                        else if (!strcmp(cid2, "63")) buildCmd63(s, info, sizeof(info));
-                        else ok = false;
-                        if (ok) sendFrame(info);
+                if (chkHi >= 0 && chkLo >= 0 && (((uint16_t)chkHi << 8) | (uint16_t)chkLo) == expectedChk) {
+                    int adr  = hexByte(b[2], b[3]);
+                    int cid1 = hexByte(b[4], b[5]);
+                    char cid2[3] = { b[6], b[7], 0 };
+
+                    if (adr == (int)_addr && cid1 == 0x46) {
+                        lastPollMs = millis();
+                        strncpy(lastCid2, cid2, sizeof(lastCid2));
+                        if (s.valid) {
+                            char info[320];
+                            bool ok = true;
+                            if (!strcmp(cid2, "61"))      buildCmd61(s, info, sizeof(info));
+                            else if (!strcmp(cid2, "62")) buildCmd62(s, info, sizeof(info));
+                            else if (!strcmp(cid2, "63")) buildCmd63(s, info, sizeof(info));
+                            else ok = false;
+                            if (ok) sendFrame(info);
+                        }
                     }
+                } else {
+                    badFrames++;
                 }
             }
             _len = 0;
-        } else {
+        } else if (_len > 0) {
+            // Only buffer payload characters after '~' has been seen
             if (_len < sizeof(_buf) - 1) _buf[_len++] = c;
-            else _len = 0;                       // Data too long. Reset to resynchronize.
+            else _len = 0;
         }
     }
 }

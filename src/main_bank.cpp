@@ -17,6 +17,8 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
+#include <nvs_flash.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Update.h>
@@ -59,7 +61,7 @@
 // Increase this on each build. Then you can confirm the live image in the
 // WebUI header and the serial banner. This proves that an OTA push worked.
 #ifndef FW_VERSION
-#define FW_VERSION "bank-1.7"
+#define FW_VERSION "bank-1.9"
 #endif
 #ifndef ESM_TX_PIN
 #define ESM_TX_PIN 33
@@ -111,52 +113,104 @@ struct Config {
     char     ntp2[48] = "";
     char     ntp3[48] = "";
     char     tz[40]   = "Europe/Moscow"; // IANA name or raw POSIX (the offset sign is INVERTED)
-    // WiFi credentials set at runtime (setup AP or WebUI). If empty, use the
-    // compile-time WIFI_SSID/WIFI_PASS. If those are unset, use the setup AP.
+    // WiFi credentials persisted in NVS ("wifi" + "bank" + esp_wifi net80211),
+    // surviving OTA updates and normal USB reflashes.
     char     wifiSsid[33] = "";
     char     wifiPass[65] = "";
 };
 static Config cfg;
 static Preferences prefs;
+static bool wifiNvsExplicit = false;     // true once "wifi" NVS namespace is initialized
+
+static void initNvs() {
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        Serial.println("[nvs] partition full or version mismatch -> reinitializing");
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+}
+
+// Persist WiFi credentials to dedicated NVS namespace "wifi" AND mirror to "bank"
+// so credentials stay isolated from routine MQTT/NTP saves and backward-compatible.
+static void saveWifiNvs(const char *ssid, const char *pass) {
+    strncpy(cfg.wifiSsid, ssid ? ssid : "", sizeof(cfg.wifiSsid) - 1);
+    cfg.wifiSsid[sizeof(cfg.wifiSsid) - 1] = 0;
+    strncpy(cfg.wifiPass, pass ? pass : "", sizeof(cfg.wifiPass) - 1);
+    cfg.wifiPass[sizeof(cfg.wifiPass) - 1] = 0;
+
+    if (prefs.begin("wifi", false)) {
+        prefs.putBool("init", true);
+        prefs.putString("ssid", cfg.wifiSsid);
+        prefs.putString("pass", cfg.wifiPass);
+        prefs.end();
+    }
+    if (prefs.begin("bank", false)) {
+        prefs.putString("wssid", cfg.wifiSsid);
+        prefs.putString("wpass", cfg.wifiPass);
+        prefs.end();
+    }
+    wifiNvsExplicit = true;
+}
 
 static void loadCfg() {
-    prefs.begin("bank", true);
-    cfg.mqttEnable = prefs.getBool("en", false);
-    prefs.getString("host", cfg.host, sizeof(cfg.host));
-    cfg.port = prefs.getUShort("port", 1883);
-    prefs.getString("user", cfg.user, sizeof(cfg.user));
-    prefs.getString("pass", cfg.pass, sizeof(cfg.pass));
-    String t = prefs.getString("topic", "esmbank"); t.toCharArray(cfg.topic, sizeof(cfg.topic));
-    cfg.perPack = prefs.getBool("pp", true);
-    cfg.interval = prefs.getUShort("intv", 5);
-    prefs.getString("ntp1", cfg.ntp1, sizeof(cfg.ntp1));
-    prefs.getString("ntp2", cfg.ntp2, sizeof(cfg.ntp2));
-    prefs.getString("ntp3", cfg.ntp3, sizeof(cfg.ntp3));
-    { String z = prefs.getString("tz", "Europe/Moscow"); z.toCharArray(cfg.tz, sizeof(cfg.tz)); }
-    prefs.getString("wssid", cfg.wifiSsid, sizeof(cfg.wifiSsid));
-    prefs.getString("wpass", cfg.wifiPass, sizeof(cfg.wifiPass));
-    prefs.end();
+    if (prefs.begin("bank", true)) {
+        cfg.mqttEnable = prefs.getBool("en", false);
+        prefs.getString("host", cfg.host, sizeof(cfg.host));
+        cfg.port = prefs.getUShort("port", 1883);
+        prefs.getString("user", cfg.user, sizeof(cfg.user));
+        prefs.getString("pass", cfg.pass, sizeof(cfg.pass));
+        String t = prefs.getString("topic", "esmbank"); t.toCharArray(cfg.topic, sizeof(cfg.topic));
+        cfg.perPack = prefs.getBool("pp", true);
+        cfg.interval = prefs.getUShort("intv", 5);
+        prefs.getString("ntp1", cfg.ntp1, sizeof(cfg.ntp1));
+        prefs.getString("ntp2", cfg.ntp2, sizeof(cfg.ntp2));
+        prefs.getString("ntp3", cfg.ntp3, sizeof(cfg.ntp3));
+        { String z = prefs.getString("tz", "Europe/Moscow"); z.toCharArray(cfg.tz, sizeof(cfg.tz)); }
+        prefs.getString("wssid", cfg.wifiSsid, sizeof(cfg.wifiSsid));
+        prefs.getString("wpass", cfg.wifiPass, sizeof(cfg.wifiPass));
+        prefs.end();
+    }
+
+    // Dedicated "wifi" NVS namespace takes precedence over legacy "bank" keys.
+    char wSsid[33] = "", wPass[65] = "";
+    if (prefs.begin("wifi", true)) {
+        wifiNvsExplicit = prefs.getBool("init", false);
+        prefs.getString("ssid", wSsid, sizeof(wSsid));
+        prefs.getString("pass", wPass, sizeof(wPass));
+        prefs.end();
+    }
+    if (wifiNvsExplicit) {
+        strncpy(cfg.wifiSsid, wSsid, sizeof(cfg.wifiSsid) - 1);
+        strncpy(cfg.wifiPass, wPass, sizeof(cfg.wifiPass) - 1);
+    } else if (cfg.wifiSsid[0]) {
+        // Migrate legacy "bank" WiFi keys into dedicated "wifi" NVS namespace
+        saveWifiNvs(cfg.wifiSsid, cfg.wifiPass);
+    }
+
     if (cfg.interval < 1) cfg.interval = 1;
     if (!cfg.ntp1[0]) strcpy(cfg.ntp1, "pool.ntp.org");
     if (!cfg.tz[0])   strcpy(cfg.tz, "Europe/Moscow");
 }
+
 static void saveCfg() {
-    prefs.begin("bank", false);
-    prefs.putBool("en", cfg.mqttEnable);
-    prefs.putString("host", cfg.host);
-    prefs.putUShort("port", cfg.port);
-    prefs.putString("user", cfg.user);
-    prefs.putString("pass", cfg.pass);
-    prefs.putString("topic", cfg.topic);
-    prefs.putBool("pp", cfg.perPack);
-    prefs.putUShort("intv", cfg.interval);
-    prefs.putString("ntp1", cfg.ntp1);
-    prefs.putString("ntp2", cfg.ntp2);
-    prefs.putString("ntp3", cfg.ntp3);
-    prefs.putString("tz", cfg.tz);
-    prefs.putString("wssid", cfg.wifiSsid);
-    prefs.putString("wpass", cfg.wifiPass);
-    prefs.end();
+    if (prefs.begin("bank", false)) {
+        prefs.putBool("en", cfg.mqttEnable);
+        prefs.putString("host", cfg.host);
+        prefs.putUShort("port", cfg.port);
+        prefs.putString("user", cfg.user);
+        prefs.putString("pass", cfg.pass);
+        prefs.putString("topic", cfg.topic);
+        prefs.putBool("pp", cfg.perPack);
+        prefs.putUShort("intv", cfg.interval);
+        prefs.putString("ntp1", cfg.ntp1);
+        prefs.putString("ntp2", cfg.ntp2);
+        prefs.putString("ntp3", cfg.ntp3);
+        prefs.putString("tz", cfg.tz);
+        prefs.putString("wssid", cfg.wifiSsid);
+        prefs.putString("wpass", cfg.wifiPass);
+        prefs.end();
+    }
 }
 
 // Readable IANA zone names -> POSIX TZ strings. The ESP32 has no tzdata
@@ -340,8 +394,8 @@ static void pollPack(Pack &p, bool deep) {
     n.current = d.current * 0.01f;
     n.soc = d.soc > 255 ? 255 : (uint8_t)d.soc;
     n.soh = d.soh > 255 ? 255 : (uint8_t)d.soh;
-    n.tmin = (int8_t)d.cellTempMin;
-    n.tmax = (int8_t)d.cellTempMax;
+    n.tmin = d.cellTempMin;
+    n.tmax = d.cellTempMax;
     n.valid = true;
     n.ts = millis();
 
@@ -351,7 +405,7 @@ static void pollPack(Pack &p, bool deep) {
             n.nCells = 0;
             for (int i = 0; i < 15; i++) if (mv[i]) n.cells[n.nCells++] = mv[i];
             n.nTemps = 0;
-            for (int i = 0; i < 15 && n.nTemps < 15; i++)
+            for (int i = 0; i < 16 && n.nTemps < 16; i++)
                 if (t[i] > -100 && t[i] < 200) n.ctemps[n.nTemps++] = t[i];
         }
         uint32_t cyc, ah;
@@ -360,6 +414,7 @@ static void pollPack(Pack &p, bool deep) {
         if (esm.readRegisters(0x100A, 15, lim)) {
             n.cvl_raw = lim[0]; n.dcl_raw = lim[1]; n.ccl_raw = lim[3];
             n.dvl_raw = lim[4]; n.ccl_coef = lim[7]; n.dcl_coef = lim[14];
+            n.haveLimits = true;
         }
         EsmStatusBits sb;
         if (esm.readStatusBits(sb)) {
@@ -377,63 +432,94 @@ static void pollPack(Pack &p, bool deep) {
 // highest cell and discharge cutoff on the lowest; take the temperature
 // extremes; a fault on any pack raises the bank fault.
 static void aggregate() {
+    static bool bankFullLatched = false;
     uint32_t now = millis();
-    int n = 0;
+    int n = 0, nWithLimits = 0;
+    bool allFull = true;
     float sumV = 0, sumI = 0; uint32_t sumSoc = 0; int minSoh = 100;
     uint16_t bankMaxCell = 0, bankMinCell = 0xFFFF;
     int16_t  bankMaxT = -128, bankMinT = 127;
     uint32_t sumCcl = 0, sumDcl = 0; uint16_t maxCyc = 0;
     uint16_t cvl = 0, dvl = 0;
+    uint16_t orSysF = 0, orCellF = 0, orProt = 0, orWarn = 0, orSpec = 0;
 
     for (unsigned i = 0; i < NUM_PACKS; i++) {
         Pack &p = pk[i];
         if (!p.s.valid || now - p.s.ts > STALE_MS) continue;
         n++;
+        if (p.s.soc < 100) allFull = false;
         sumV += p.s.packV; sumI += p.s.current; sumSoc += p.s.soc;
         if (p.s.soh < minSoh) minSoh = p.s.soh;
         bankMaxT = max<int16_t>(bankMaxT, p.s.tmax);
         bankMinT = min<int16_t>(bankMinT, p.s.tmin);
         if (maxCyc < p.s.cycles) maxCyc = p.s.cycles;
-        // cell extremes per pack
+
+        orSysF  |= p.s.sysFault;
+        orCellF |= p.s.cellFault;
+        orProt  |= p.s.prot;
+        orWarn  |= p.s.warn;
+        orSpec  |= p.s.special;
+
+        uint16_t pMaxC = 0, pMinC = 0xFFFF;
         for (uint8_t c = 0; c < p.s.nCells; c++) {
             if (p.s.cells[c] > bankMaxCell) bankMaxCell = p.s.cells[c];
             if (p.s.cells[c] < bankMinCell) bankMinCell = p.s.cells[c];
+            if (p.s.cells[c] > pMaxC) pMaxC = p.s.cells[c];
+            if (p.s.cells[c] < pMinC) pMinC = p.s.cells[c];
         }
-        // Limits: sum the EFFECTIVE per-pack amps (deci-A). The bank coef is set
-        // to 100 (no-op) below, so buildCmd63 does not apply it a second time. A
-        // full pack tapers its own CCL, so the sum of the effective values gives
-        // the true bank limit. Fail-safe: a pack whose limit block never read
-        // (raw==0) adds ZERO headroom, not an invented default. In normal
-        // operation the code deep-reads every reachable pack on the first pass.
-        uint32_t cclE = p.s.ccl_raw;
-        uint32_t dclE = p.s.dcl_raw;
-        // The coefficient (registers 0x1011/0x1018, %) only DERATES. Clamp it to
-        // 100, so a corrupt or oversized read (e.g. 0xFFFF) can never inflate the
-        // limit. A 0 coef leaves the raw value unscaled (matches the proven emitter).
-        uint16_t cclC = p.s.ccl_coef > 100 ? 100 : p.s.ccl_coef;
-        uint16_t dclC = p.s.dcl_coef > 100 ? 100 : p.s.dcl_coef;
-        if (cclE && cclC) cclE = cclE * cclC / 100;
-        if (dclE && dclC) dclE = dclE * dclC / 100;
-        sumCcl += cclE;
-        sumDcl += dclE;
-        // The parallel bus shares the voltages, so do not sum them. Charge to the
-        // lowest CVL and stop discharge at the highest DVL that any pack reports.
-        // This is the most conservative choice when packs disagree a little.
+
+        if (p.s.haveLimits) {
+            nWithLimits++;
+            uint32_t cclE = p.s.ccl_raw;
+            uint32_t dclE = p.s.dcl_raw;
+            uint16_t cclC = p.s.ccl_coef > 100 ? 100 : p.s.ccl_coef;
+            uint16_t dclC = p.s.dcl_coef > 100 ? 100 : p.s.dcl_coef;
+            if (cclC > 0) cclE = cclE * cclC / 100;
+            if (dclC > 0) dclE = dclE * dclC / 100;
+
+            // Per-pack LiFePO4 temperature & cell-voltage safety envelope
+            bool pFault = (p.s.sysFault | p.s.cellFault | p.s.prot) != 0;
+            if (pFault || p.s.tmax >= 55 || p.s.tmin <= 0 || (pMaxC >= 3620)) {
+                cclE = 0;
+            } else {
+                if (p.s.tmin <= 5 && cclE > 100)       cclE = 100; // <=5C: 10A/pack
+                else if (p.s.tmin <= 12 && cclE > 300) cclE = 300; // <=12C: 30A/pack
+                if (pMaxC >= 3550 && cclE > 50)        cclE = 50;  // >=3.55V: 5A/pack balance taper
+                else if (pMaxC >= 3500 && cclE > 150)  cclE = 150; // >=3.50V: 15A/pack taper
+            }
+            if ((p.s.sysFault | p.s.cellFault) != 0 || p.s.tmax >= 58 || (p.s.nCells && pMinC <= 2800)) {
+                dclE = 0;
+            }
+            sumCcl += cclE;
+            sumDcl += dclE;
+        }
         if (p.s.cvl_raw && (!cvl || p.s.cvl_raw < cvl)) cvl = p.s.cvl_raw;
         if (p.s.dvl_raw && (!dvl || p.s.dvl_raw > dvl)) dvl = p.s.dvl_raw;
     }
-    if (!cvl) cvl = 540;      // fallback 54.0 V if no pack reported a limit
-    if (!dvl) dvl = 475;      // 47.5 V
+    if (!cvl) cvl = 540;      // fallback 54.0 V
+    if (!dvl) dvl = 475;      // fallback 47.5 V
 
     PackSnapshot a;
     a.valid = (n > 0);
     if (n > 0) {
+        uint8_t avgSoc = (uint8_t)(sumSoc / n);
+        // Clean full-charge hysteresis latch:
+        // Latch fullStop when every active pack is 100% SOC, current has tapered near 0, and cells >= 3.38V
+        if (allFull && fabsf(sumI) <= 0.4f && (bankMinCell == 0xFFFF || bankMinCell >= 3380)) {
+            bankFullLatched = true;
+        } else if (!allFull || avgSoc <= 98 || sumI < -0.8f || (bankMinCell != 0xFFFF && bankMinCell < 3350)) {
+            bankFullLatched = false;
+        }
+        if (bankFullLatched) sumCcl = 0;
+
+        a.haveLimits = (nWithLimits > 0);
+        a.fullStop = bankFullLatched;
         a.packV = sumV / n;
         a.current = sumI;
-        a.soc = sumSoc / n;
+        a.soc = avgSoc;
         a.soh = minSoh;
         a.tmin = bankMinT; a.tmax = bankMaxT;
-        a.nTemps = 0;                                // the emulator falls back to tmin/tmax
+        a.nTemps = 0;                                // emulator uses tmin/tmax
         a.cycles = maxCyc;
         if (bankMaxCell) { a.cells[0] = bankMaxCell; a.cells[1] = bankMinCell; a.nCells = 2; }
         else a.nCells = 0;
@@ -441,6 +527,8 @@ static void aggregate() {
         a.ccl_raw = sumCcl > 65535 ? 65535 : sumCcl;
         a.dcl_raw = sumDcl > 65535 ? 65535 : sumDcl;
         a.ccl_coef = 100; a.dcl_coef = 100;          // already effective
+        a.sysFault = orSysF; a.cellFault = orCellF;
+        a.prot = orProt; a.warn = orWarn; a.special = orSpec;
         a.ts = now;
     }
     agg = a;
@@ -453,7 +541,7 @@ static void esmTask(void *) {
     uint32_t deepCtr = 0;
     for (;;) {
         for (unsigned i = 0; i < NUM_PACKS; i++) {
-            bool deep = (deepCtr++ % (NUM_PACKS * 3)) < NUM_PACKS;   // read cells and limits on about 1/3 of passes
+            bool deep = !pk[i].s.haveLimits || !pk[i].s.valid || ((deepCtr++ % (NUM_PACKS * 3)) < NUM_PACKS);
             pollPack(pk[i], deep);
         }
         if (xSemaphoreTake(mux, pdMS_TO_TICKS(50)) == pdTRUE) { aggregate(); xSemaphoreGive(mux); }
@@ -553,32 +641,110 @@ static WebServer web(80);
 static DNSServer dnsServer;              // captive portal in setup-AP mode
 static bool      apMode = false;         // true = the device hosts the setup AP
 
-// Start WiFi: try the configured station. If that fails, or nothing is
-// configured, fall back to the setup AP with a captive portal. Then the user
-// can enter their network from a phone. RS485 translation runs either way.
+static String htmlEsc(const char *s) {
+    String out;
+    if (!s) return out;
+    for (; *s; s++) {
+        switch (*s) {
+            case '&':  out += F("&amp;");  break;
+            case '<':  out += F("&lt;");   break;
+            case '>':  out += F("&gt;");   break;
+            case '"':  out += F("&quot;"); break;
+            case '\'': out += F("&#39;");  break;
+            default:   out += *s;          break;
+        }
+    }
+    return out;
+}
+
+static String jsonEsc(const char *s) {
+    String out;
+    if (!s) return out;
+    for (; *s; s++) {
+        if (*s == '"' || *s == '\\') out += '\\';
+        if ((uint8_t)*s >= 0x20) out += *s;
+    }
+    return out;
+}
+
+// Start WiFi with multi-layer NVS persistence:
+//   1. Dedicated NVS namespace "wifi" (+ mirrored "bank" keys).
+//   2. Auto-recovery from ESP-IDF nvs.net80211 on upgrade if "wifi" NVS is new.
+//   3. One-time seed from compile-time WIFI_SSID/WIFI_PASS into NVS if set.
+//   4. Runtime WiFi storage locked to RAM so fallback AP never overwrites NVS.
+//   5. If saved WiFi is temporarily unreachable (e.g. router booting after a
+//      power outage), runs AP+STA fallback and auto-rejoins when router comes up.
 static void startWifi() {
-    const char *ss = cfg.wifiSsid[0] ? cfg.wifiSsid : WIFI_SSID;
-    const char *pw = cfg.wifiSsid[0] ? cfg.wifiPass : WIFI_PASS;
-    bool haveCreds = ss[0] && strcmp(ss, "YOUR_WIFI_SSID") != 0;
-    if (haveCreds) {
-        WiFi.mode(WIFI_STA);
+    WiFi.setHostname("esm-bank");
+    WiFi.mode(WIFI_STA);   // initializes esp_wifi with flash NVS open so we can inspect/sync net80211
+
+    wifi_config_t idfCfg{};
+    char idfSsid[33] = "", idfPass[65] = "";
+    if (esp_wifi_get_config(WIFI_IF_STA, &idfCfg) == ESP_OK) {
+        memcpy(idfSsid, idfCfg.sta.ssid, 32);     idfSsid[32] = 0;
+        memcpy(idfPass, idfCfg.sta.password, 64); idfPass[64] = 0;
+    }
+
+    // First boot on NVS-managed firmware: recover from esp_wifi NVS or compile-time macros
+    if (!wifiNvsExplicit && !cfg.wifiSsid[0]) {
+        if (idfSsid[0] && strcmp(idfSsid, AP_SSID) != 0 && strcmp(idfSsid, "YOUR_WIFI_SSID") != 0) {
+            Serial.printf("[nvs] recovered WiFi '%s' from esp_wifi NVS -> saving to NVS\n", idfSsid);
+            saveWifiNvs(idfSsid, idfPass);
+        } else if (WIFI_SSID[0] && strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0) {
+            Serial.printf("[nvs] seeding compile-time WiFi '%s' into NVS\n", WIFI_SSID);
+            saveWifiNvs(WIFI_SSID, WIFI_PASS);
+        }
+    }
+
+    // Mirror authoritative NVS credentials into esp_wifi flash config once, then lock runtime to RAM
+    if (cfg.wifiSsid[0]) {
+        if (strcmp(idfSsid, cfg.wifiSsid) != 0 || strcmp(idfPass, cfg.wifiPass) != 0) {
+            wifi_config_t newCfg{};
+            strncpy((char *)newCfg.sta.ssid, cfg.wifiSsid, sizeof(newCfg.sta.ssid));
+            strncpy((char *)newCfg.sta.password, cfg.wifiPass, sizeof(newCfg.sta.password));
+            esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+            esp_wifi_set_config(WIFI_IF_STA, &newCfg);
+        }
+    } else if (wifiNvsExplicit && idfSsid[0]) {
+        wifi_config_t emptyCfg{};
+        esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+        esp_wifi_set_config(WIFI_IF_STA, &emptyCfg);
+    }
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    WiFi.persistent(false);
+
+    if (cfg.wifiSsid[0]) {
         WiFi.setSleep(false);
-        WiFi.begin(ss, pw);
+        WiFi.setAutoReconnect(true);
+        WiFi.begin(cfg.wifiSsid, cfg.wifiPass);
+        Serial.printf("[wifi] connecting to NVS SSID '%s'", cfg.wifiSsid);
         uint32_t t0 = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) { delay(250); Serial.print('.'); }
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) {
+            delay(250);
+            Serial.print('.');
+        }
         Serial.println();
-        if (WiFi.isConnected()) {
+        if (WiFi.status() == WL_CONNECTED) {
             apMode = false;
-            Serial.printf("WiFi '%s' ip=%s\n", ss, WiFi.localIP().toString().c_str());
+            Serial.printf("[wifi] connected '%s' ip=%s (NVS persisted)\n",
+                          cfg.wifiSsid, WiFi.localIP().toString().c_str());
             return;
         }
-        Serial.printf("WiFi '%s' connect failed -> ", ss);
+        Serial.printf("[wifi] '%s' unreachable at boot -> AP+STA fallback (auto-retrying every 30s)\n",
+                      cfg.wifiSsid);
+        WiFi.mode(WIFI_AP_STA);
+        WiFi.setSleep(false);
+        WiFi.softAP(AP_SSID, AP_PASS);
+        dnsServer.start(53, "*", WiFi.softAPIP());
+        apMode = true;
+        return;
     }
+
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASS);
     dnsServer.start(53, "*", WiFi.softAPIP());
     apMode = true;
-    Serial.printf("setup AP '%s' (pass '%s') at http://%s/\n",
+    Serial.printf("[wifi] setup AP '%s' (pass '%s') at http://%s/\n",
                   AP_SSID, AP_PASS, WiFi.softAPIP().toString().c_str());
 }
 
@@ -593,11 +759,18 @@ static String htmlPage() {
                  "th:first-child,td:first-child{text-align:left}input{padding:4px}fieldset{margin:12px 0}"
                  ".b{font-size:22px;font-weight:bold}</style>"
                  "<h2>ESM bank <span style='font-size:13px;color:#888;font-weight:normal'>fw " FW_VERSION "</span></h2>");
-    if (apMode)
-        h += F("<p style='background:#fee3e3;padding:8px;border-radius:4px'><b>Setup mode.</b> "
-               "Enter your WiFi below and press Save &mdash; the device reboots and joins your network.</p>");
-    else
-        h += "<p style='color:#0a0;font-size:13px'>WiFi: " + WiFi.SSID() + " &nbsp; " + WiFi.localIP().toString() + "</p>";
+    if (apMode) {
+        if (cfg.wifiSsid[0])
+            h += "<p style='background:#fff4d6;padding:8px;border-radius:4px'><b>Fallback AP mode.</b> "
+                 "Saved WiFi <b>" + htmlEsc(cfg.wifiSsid) + "</b> was unreachable at boot (retrying automatically every 30s), "
+                 "or enter new WiFi credentials below.</p>";
+        else
+            h += F("<p style='background:#fee3e3;padding:8px;border-radius:4px'><b>Setup mode.</b> "
+                   "Enter your WiFi below and press Save &mdash; credentials are stored in NVS flash and survive reflashing.</p>");
+    } else {
+        h += "<p style='color:#0a0;font-size:13px'>WiFi: " + htmlEsc(WiFi.SSID().c_str()) + " &nbsp; "
+             + WiFi.localIP().toString() + " &nbsp; <span style='color:#666'>(saved in NVS)</span></p>";
+    }
     if (a.valid) {
         h += "<p class=b>" + String(a.soc) + "% &nbsp; " + String(a.packV, 1) + " V &nbsp; "
              + String(a.current, 1) + " A</p>";
@@ -619,15 +792,16 @@ static String htmlPage() {
     }
     h += F("</table>"
            "<form method=POST action=/save>"
-           "<fieldset><legend>WiFi</legend>"
-           "SSID <input name=wssid value='%WSSID%'><br>"
-           "Password <input name=wpass type=password placeholder='(unchanged)'><br>"
-           "<span style='color:#999;font-size:12px'>setting a new network reboots the device to connect</span>"
+           "<fieldset><legend>WiFi (NVS Persistent)</legend>"
+           "SSID <input name=wssid value='%WSSID%' maxlength=32><br>"
+           "Password <input name=wpass type=password placeholder='%WPPH%' maxlength=64 autocomplete=new-password><br>"
+           "<span style='color:#666;font-size:12px'>%WNVS%</span><br>"
+           "<label style='color:#999;font-size:12px'><input type=checkbox name=wclr> forget saved WiFi (boot to setup AP)</label>"
            "</fieldset>"
            "<fieldset><legend>MQTT</legend>"
            "<label><input type=checkbox name=en %EN%> enable</label><br>"
            "Broker <input name=host value='%HOST%'> : <input name=port size=5 value='%PORT%'><br>"
-           "User <input name=user value='%USER%'> Pass <input name=pass type=password value='%PASS%'><br>"
+           "User <input name=user value='%USER%'> Pass <input name=pass type=password placeholder='%MPPH%' autocomplete=new-password><br>"
            "Topic <input name=topic value='%TOPIC%'> Interval <input name=intv size=4 value='%INTV%'>s<br>"
            "<label><input type=checkbox name=pp %PP%> publish each pack separately</label>"
            "</fieldset>"
@@ -643,20 +817,26 @@ static String htmlPage() {
            "<fieldset><legend>Firmware</legend>"
            "<form method=POST action=/update enctype='multipart/form-data'>"
            "<input type=file name=fw accept=.bin> <button>Upload &amp; reboot</button></form>"
-           "<p style='color:#999;font-size:12px'>OTA also available via espota (port 3232).</p></fieldset>");
+           "<p style='color:#999;font-size:12px'>OTA &amp; USB firmware uploads keep NVS WiFi/MQTT settings intact. Also available via espota (port 3232).</p></fieldset>");
     char nowStr[26] = "not synced yet";
     uint32_t ep = epochNow();
     if (ep) { time_t tt = ep; struct tm lt; localtime_r(&tt, &lt); strftime(nowStr, sizeof(nowStr), "%Y-%m-%d %H:%M:%S", &lt); }
     h.replace("%EN%", cfg.mqttEnable ? "checked" : "");
-    h.replace("%HOST%", cfg.host); h.replace("%PORT%", String(cfg.port));
-    h.replace("%USER%", cfg.user); h.replace("%PASS%", cfg.pass);
-    h.replace("%TOPIC%", cfg.topic); h.replace("%INTV%", String(cfg.interval));
+    h.replace("%HOST%", htmlEsc(cfg.host)); h.replace("%PORT%", String(cfg.port));
+    h.replace("%USER%", htmlEsc(cfg.user));
+    h.replace("%MPPH%", cfg.pass[0] ? "(saved — leave blank to keep)" : "(none)");
+    h.replace("%TOPIC%", htmlEsc(cfg.topic)); h.replace("%INTV%", String(cfg.interval));
     h.replace("%PP%", cfg.perPack ? "checked" : "");
     String tzOpts;
     for (unsigned i = 0; i < TZ_TABLE_N; i++) { tzOpts += "<option value='"; tzOpts += TZ_TABLE[i].name; tzOpts += "'>"; }
-    h.replace("%NTP1%", cfg.ntp1); h.replace("%NTP2%", cfg.ntp2); h.replace("%NTP3%", cfg.ntp3);
-    h.replace("%TZ%", cfg.tz); h.replace("%NOW%", nowStr); h.replace("%TZOPTS%", tzOpts);
-    h.replace("%WSSID%", WiFi.isConnected() ? WiFi.SSID() : String(cfg.wifiSsid));
+    h.replace("%NTP1%", htmlEsc(cfg.ntp1)); h.replace("%NTP2%", htmlEsc(cfg.ntp2)); h.replace("%NTP3%", htmlEsc(cfg.ntp3));
+    h.replace("%TZ%", htmlEsc(cfg.tz)); h.replace("%NOW%", nowStr); h.replace("%TZOPTS%", tzOpts);
+    h.replace("%WSSID%", htmlEsc(cfg.wifiSsid));
+    h.replace("%WPPH%", cfg.wifiPass[0] ? "(saved in NVS — leave blank to keep)" : "(password)");
+    String wnvs = cfg.wifiSsid[0]
+        ? ("Saved in NVS: <b>" + htmlEsc(cfg.wifiSsid) + "</b> (" + (cfg.wifiPass[0] ? "password set" : "open network") + " &bull; survives OTA &amp; USB reflash)")
+        : String("No WiFi saved in NVS yet");
+    h.replace("%WNVS%", wnvs);
     return h;
 }
 
@@ -665,31 +845,53 @@ static void handleSave() {
     web.arg("host").toCharArray(cfg.host, sizeof(cfg.host));
     cfg.port = web.arg("port").toInt() ?: 1883;
     web.arg("user").toCharArray(cfg.user, sizeof(cfg.user));
-    web.arg("pass").toCharArray(cfg.pass, sizeof(cfg.pass));
-    web.arg("topic").toCharArray(cfg.topic, sizeof(cfg.topic));
+    if (web.arg("pass").length()) {
+        web.arg("pass").toCharArray(cfg.pass, sizeof(cfg.pass));
+    } else if (!cfg.user[0]) {
+        cfg.pass[0] = 0;
+    }
+    if (web.arg("topic").length()) web.arg("topic").toCharArray(cfg.topic, sizeof(cfg.topic));
     cfg.interval = web.arg("intv").toInt() ?: 5;
     cfg.perPack = web.hasArg("pp");
     web.arg("ntp1").toCharArray(cfg.ntp1, sizeof(cfg.ntp1));
     web.arg("ntp2").toCharArray(cfg.ntp2, sizeof(cfg.ntp2));
     web.arg("ntp3").toCharArray(cfg.ntp3, sizeof(cfg.ntp3));
     if (web.arg("tz").length()) web.arg("tz").toCharArray(cfg.tz, sizeof(cfg.tz));
-    // WiFi: update the SSID if given. Update the password only if the user typed
-    // a new one (a blank password field means "keep the current one"). Reboot to
-    // apply a change.
+
+    // WiFi NVS update: never wipe the saved password when the password field is left blank.
     bool wifiChanged = false;
-    if (web.hasArg("wssid") && web.arg("wssid").length()) {
+    if (web.hasArg("wclr")) {
+        saveWifiNvs("", "");
+        wifiChanged = true;
+    } else if (web.hasArg("wssid")) {
         String ns = web.arg("wssid"), np = web.arg("wpass");
-        if (ns != String(cfg.wifiSsid)) wifiChanged = true;
-        ns.toCharArray(cfg.wifiSsid, sizeof(cfg.wifiSsid));
-        if (np.length()) { np.toCharArray(cfg.wifiPass, sizeof(cfg.wifiPass)); wifiChanged = true; }
+        if (ns.length() > 0) {
+            bool ssidDiff = (ns != String(cfg.wifiSsid));
+            if (ssidDiff || np.length() > 0) {
+                char newSsid[33] = "", newPass[65] = "";
+                ns.toCharArray(newSsid, sizeof(newSsid));
+                if (np.length() > 0) {
+                    np.toCharArray(newPass, sizeof(newPass));
+                } else if (!ssidDiff) {
+                    strncpy(newPass, cfg.wifiPass, sizeof(newPass) - 1);
+                }
+                // Note: if ssidDiff && np is empty, newPass stays "" (open WiFi network).
+                saveWifiNvs(newSsid, newPass);
+                wifiChanged = true;
+            } else if (apMode && cfg.wifiSsid[0]) {
+                // Pressing Save in fallback AP mode with existing NVS creds triggers a fresh connect attempt
+                wifiChanged = true;
+            }
+        }
     }
+
     saveCfg();
-    applyNtp();                          // re-sync with the new servers and TZ immediately
+    if (!apMode) applyNtp();             // re-sync with the new servers and TZ immediately
     if (mqtt.connected()) mqtt.disconnect();
     if (wifiChanged) {
         web.send(200, "text/html",
-                 "<meta http-equiv=refresh content='8;url=/'>WiFi saved &mdash; rebooting to connect. "
-                 "If it joins your network, reopen this page at its new address.");
+                 "<meta http-equiv=refresh content='8;url=/'>WiFi saved to NVS &mdash; rebooting to connect. "
+                 "If it joins your network, reopen this page at its LAN address.");
         delay(600);
         ESP.restart();
     }
@@ -711,9 +913,11 @@ static void handleStatus() {
     if (ep) { time_t tt = ep; struct tm lt; localtime_r(&tt, &lt); strftime(localStr, sizeof(localStr), "%Y-%m-%d %H:%M:%S", &lt); }
     String j = "{\"fw\":\"" FW_VERSION "\",\"up\":" + String(now / 1000);
     j += ",\"net\":{\"ap\":" + String(apMode ? 1 : 0) +
-         ",\"ssid\":\"" + (apMode ? String(AP_SSID) : WiFi.SSID()) +
+         ",\"ssid\":\"" + jsonEsc(apMode ? AP_SSID : WiFi.SSID().c_str()) +
          "\",\"ip\":\"" + (apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) +
-         "\",\"rssi\":" + String(apMode ? 0 : WiFi.RSSI()) + "}";
+         "\",\"rssi\":" + String(apMode ? 0 : WiFi.RSSI()) +
+         ",\"nvs_saved\":" + String(cfg.wifiSsid[0] ? 1 : 0) +
+         ",\"nvs_ssid\":\"" + jsonEsc(cfg.wifiSsid) + "\"}";
     j += ",\"time\":{\"epoch\":" + String(ep) + ",\"synced\":" + String(ep ? 1 : 0) +
          ",\"local\":\"" + String(localStr) + "\",\"tz\":\"" + String(cfg.tz) +
          "\",\"posix\":\"" + String(tzToPosix(cfg.tz)) + "\",\"ntp\":\"" + String(cfg.ntp1) + "\"}";
@@ -725,6 +929,8 @@ static void handleStatus() {
          ",\"cvl\":" + String(a.cvl_raw / 10.0, 1) + ",\"dvl\":" + String(a.dvl_raw / 10.0, 1) +
          ",\"age\":" + String(a.valid ? now - a.ts : 0) + "}";
     j += ",\"deye\":{\"answered\":" + String(deye.answered) +
+         ",\"badFrames\":" + String(deye.badFrames) +
+         ",\"fullStop\":" + String(a.fullStop ? 1 : 0) +
          ",\"pollAge\":" + String((int32_t)(dPoll == 0xFFFFFFFF ? -1 : (int32_t)dPoll)) +
          ",\"cid\":\"" + String(deye.lastCid2) + "\"}";
     j += ",\"packs\":[";
@@ -797,11 +1003,17 @@ void setup() {
     displayInit();
     displayStatus("ESM bank", "starting...");
 #endif
+    initNvs();
     loadCfg();
 
+    // Start RS485 translation tasks BEFORE waiting on WiFi so the Deye inverter
+    // receives BMS frames immediately on boot even if the router is offline.
     Serial2.begin(9600, SERIAL_8N1, DEYE_RX_PIN, DEYE_TX_PIN);
+    mux = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(esmTask,  "esm",  8192, nullptr, 2, &esmH,  0);
+    xTaskCreatePinnedToCore(deyeTask, "deye", 4096, nullptr, 3, &deyeH, 1);
 
-    startWifi();                         // station, or fall back to the setup AP
+    startWifi();                         // station from NVS, or fallback AP
     if (!apMode) applyNtp();             // SNTP only works once online
 
     ArduinoOTA.setHostname("esm-bank");
@@ -815,14 +1027,11 @@ void setup() {
     web.onNotFound([]() { web.sendHeader("Location", "/"); web.send(302, "text/plain", ""); });
     web.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
     web.begin();
-
-    mux = xSemaphoreCreateMutex();
-    xTaskCreatePinnedToCore(esmTask,  "esm",  8192, nullptr, 2, &esmH,  0);
-    xTaskCreatePinnedToCore(deyeTask, "deye", 4096, nullptr, 3, &deyeH, 1);
 }
 
 void loop() {
     static uint32_t lastWifi = 0, lastMqtt = 0, lastPub = 0, lastDisp = 0, lastStat = 0;
+    static bool wasConnected = false;
     uint32_t now = millis();
 
     ArduinoOTA.handle();
@@ -830,15 +1039,41 @@ void loop() {
     if (apMode) dnsServer.processNextRequest();
     if (mqtt.connected()) mqtt.loop();
 
-    // Station keepalive runs only in station mode. AP-mode retries would drop clients.
-    if (!apMode && now - lastWifi > 5000) {
-        lastWifi = now;
-        if (!WiFi.isConnected()) {
-            const char *ss = cfg.wifiSsid[0] ? cfg.wifiSsid : WIFI_SSID;
-            const char *pw = cfg.wifiSsid[0] ? cfg.wifiPass : WIFI_PASS;
-            WiFi.begin(ss, pw);
+    if (apMode) {
+        // If we fell back to AP+STA because the home router was still booting
+        // (e.g. after a grid outage), close the setup AP as soon as STA connects,
+        // or retry saved NVS WiFi every 30s whenever no client is on the AP.
+        if (cfg.wifiSsid[0] && WiFi.status() == WL_CONNECTED) {
+            Serial.printf("[wifi] '%s' connected (ip=%s) -> closing fallback AP\n",
+                          cfg.wifiSsid, WiFi.localIP().toString().c_str());
+            dnsServer.stop();
+            WiFi.softAPdisconnect(true);
+            WiFi.mode(WIFI_STA);
+            WiFi.setSleep(false);
+            apMode = false;
+            wasConnected = true;
+            applyNtp();
+        } else if (cfg.wifiSsid[0] && now - lastWifi > 30000) {
+            lastWifi = now;
+            if (WiFi.softAPgetStationNum() == 0) {
+                WiFi.begin(cfg.wifiSsid, cfg.wifiPass);
+            }
+        }
+    } else {
+        bool up = (WiFi.status() == WL_CONNECTED);
+        if (up && !wasConnected) {
+            wasConnected = true;
+            applyNtp();
+        } else if (!up) {
+            wasConnected = false;
+            // Space reconnect calls 25s apart so WPA2 handshakes are never aborted mid-flight
+            if (cfg.wifiSsid[0] && now - lastWifi > 25000) {
+                lastWifi = now;
+                WiFi.begin(cfg.wifiSsid, cfg.wifiPass);
+            }
         }
     }
+
     if (!apMode && cfg.mqttEnable && !mqtt.connected() && now - lastMqtt > 5000) { lastMqtt = now; mqttReconnect(); }
     if (!apMode && now - lastPub > cfg.interval * 1000UL) { lastPub = now; mqttPublish(); }
 
@@ -859,7 +1094,9 @@ void loop() {
         v.soc = a.soc; v.soh = a.soh; v.packV = a.packV; v.current = a.current;
         v.tmin = a.tmin; v.tmax = a.tmax;
         v.cclA = a.ccl_raw / 10; v.dclA = a.dcl_raw / 10;
-        static String ip; ip = WiFi.isConnected() ? WiFi.localIP().toString() : String("WiFi...");
+        static String ip;
+        ip = WiFi.isConnected() ? WiFi.localIP().toString()
+           : (apMode ? ("AP " + WiFi.softAPIP().toString()) : String("WiFi..."));
         v.ip = ip.c_str();
         v.mqttOn = cfg.mqttEnable; v.mqttOk = mqtt.connected();
         v.deyeAgeMs = deye.lastPollMs ? (now - deye.lastPollMs) : UINT32_MAX;
@@ -874,7 +1111,8 @@ void loop() {
         Serial.printf("[bank] %s soc=%d%% %.2fV %+.2fA soh=%d %d..%dC CCL=%.1f DCL=%.1f | deye=%lu ip=%s mqtt=%d\n",
                       a.valid ? "OK" : "--", a.soc, a.packV, a.current, a.soh, a.tmin, a.tmax,
                       a.ccl_raw / 10.0, a.dcl_raw / 10.0, (unsigned long)deye.answered,
-                      WiFi.localIP().toString().c_str(), mqtt.connected());
+                      apMode ? WiFi.softAPIP().toString().c_str() : WiFi.localIP().toString().c_str(),
+                      mqtt.connected());
     }
     delay(2);
 }
