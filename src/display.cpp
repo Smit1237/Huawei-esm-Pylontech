@@ -83,7 +83,7 @@ void displayTranslator(const TranslatorView &v) {
     spr.drawFastHLine(0, 96, 240, TFT_DARKGREY);
 
     // --- Deye side ---
-    bool recent = v.deyeAgeMs != UINT32_MAX && v.deyeAgeMs < 3000;
+    bool recent = v.deyeAgeMs != UINT32_MAX && v.deyeAgeMs < 25000;
     uint16_t dCol = recent ? TFT_GREEN
                     : (v.deyeAnswered ? TFT_YELLOW : TFT_DARKGREY);
     spr.setTextColor(dCol, TFT_BLACK);
@@ -172,7 +172,7 @@ void displayBank(const BankView &v) {
     snprintf(buf, sizeof(buf), "SOH %d%%  %d..%dC  CCL %dA DCL %dA",
              v.soh, v.tmin, v.tmax, v.cclA, v.dclA);
     spr.drawString(buf, 6, 102, 1);
-    spr.setTextColor(v.deyeAgeMs != UINT32_MAX && v.deyeAgeMs < 3000 ? TFT_GREEN : TFT_DARKGREY,
+    spr.setTextColor(v.deyeAgeMs != UINT32_MAX && v.deyeAgeMs < 25000 ? TFT_GREEN : TFT_DARKGREY,
                      TFT_BLACK);
     if (v.deyeAgeMs == UINT32_MAX) snprintf(buf, sizeof(buf), "Deye: waiting");
     else snprintf(buf, sizeof(buf), "Deye: %lus", (unsigned long)(v.deyeAgeMs / 1000));

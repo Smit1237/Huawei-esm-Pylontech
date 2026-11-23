@@ -61,7 +61,7 @@
 // Increase this on each build. Then you can confirm the live image in the
 // WebUI header and the serial banner. This proves that an OTA push worked.
 #ifndef FW_VERSION
-#define FW_VERSION "bank-2.1"
+#define FW_VERSION "bank-2.2"
 #endif
 #ifndef ESM_TX_PIN
 #define ESM_TX_PIN 33
@@ -90,6 +90,7 @@ struct Pack {
     uint8_t  addr;
     bool     authed = false;
     uint8_t  fails = 0;
+    uint32_t nextProbeMs = 0; // cooldown before re-probing an offline pack
     char     serial[24] = "";
     PackSnapshot s;           // s.valid = fresh data. s.ts = time of last read.
 };
@@ -368,15 +369,31 @@ static void extractSerial(const char *blob, char *out, size_t n) {
 }
 
 static void pollPack(Pack &p, bool deep) {
-    esm.setTarget(p.addr, false);        // 8N1 (this also restarts the UART)
+    uint32_t now = millis();
+    if (!p.authed && p.nextProbeMs && (int32_t)(now - p.nextProbeMs) < 0) {
+        return; // offline pack in cooldown: keep polling healthy packs without delay
+    }
+    esm.setTarget(p.addr, false);        // 8N1
     if (!p.authed) {
-        esm.wake();
+        // Fast 400 ms ping instead of 35 s wake() so 1 offline pack never stalls the bank!
+        if (!esm.ping(400)) {
+            p.fails++;
+            p.nextProbeMs = millis() + (p.fails > 2 ? 10000 : 2000);
+            return;
+        }
         p.authed = esm.authenticate();
-        if (!p.authed) { p.fails++; return; }
+        if (!p.authed) {
+            p.fails++;
+            p.nextProbeMs = millis() + 5000;
+            return;
+        }
+        p.fails = 0;
+        p.nextProbeMs = 0;
+        deep = true;                     // populate cells/limits/faults immediately on link-up
         static char blob[1024];
         char sn[24] = "";
         if (esm.readArchiveInfo(blob, sizeof(blob))) extractSerial(blob, sn, sizeof(sn));
-        if (sn[0] && xSemaphoreTake(mux, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (sn[0] && xSemaphoreTake(mux, pdMS_TO_TICKS(100)) == pdTRUE) {
             strncpy(p.serial, sn, sizeof(p.serial)); p.serial[sizeof(p.serial) - 1] = 0;
             xSemaphoreGive(mux);                 // guards the cross-task serial read
         }
@@ -523,6 +540,9 @@ static void aggregate() {
                 else if (p.s.tmin <= 12 && cclE > 300) cclE = 300; // <=12C: 30A/pack
                 if (pMaxC >= 3550 && cclE > 50)        cclE = 50;  // >=3.55V: 5A/pack balance taper
                 else if (pMaxC >= 3500 && cclE > 150)  cclE = 150; // >=3.50V: 15A/pack taper
+                // If this pack already reached 100% SOC and tapered out (charge FET open),
+                // do not count its full bulk rating so remaining <100% packs aren't overloaded.
+                if (p.s.soc >= 100 && p.s.current <= 1.0f && cclE > 50) cclE = 50;
             }
             if ((p.s.sysFault | p.s.cellFault) != 0 || p.s.tmax >= 58 || (p.s.nCells && pMinC <= 2800)) {
                 dclE = 0;
@@ -559,6 +579,7 @@ static void aggregate() {
 
         a.haveLimits = (nWithLimits > 0);
         a.fullStop = bankFullLatched;
+        a.nPacks = (uint8_t)n;
         a.packV = sumV / n;
         a.busV = sumBusV / n;
         a.current = sumI;
@@ -587,7 +608,9 @@ static void aggregate() {
         a.cvl_raw = cvl; a.dvl_raw = dvl;
         a.ccl_raw = sumCcl > 65535 ? 65535 : sumCcl;
         a.dcl_raw = sumDcl > 65535 ? 65535 : sumDcl;
-        a.ccl_coef = 100; a.dcl_coef = 100;          // already effective
+        a.ccl_coef = 100; a.dcl_coef = 100;
+        // Synchronize aggregate CCL/DCL with the exact Pylontech 0x63 effective limits
+        PylontechEmu::effectiveLimits(a, a.ccl_raw, a.dcl_raw);
         a.sysFault = orSysF; a.cellFault = orCellF;
         a.prot = orProt; a.warn = orWarn; a.special = orSpec;
         a.ts = now;
@@ -1018,7 +1041,7 @@ static void handleStatus() {
         String temps = "["; for (uint8_t c = 0; c < p.s.nTemps; c++) { if (c) temps += ","; temps += String(p.s.ctemps[c]); } temps += "]";
         if (i) j += ",";
         j += "{\"addr\":" + String(p.addr) + ",\"sn\":\"" + String(p.serial) +
-             "\",\"ok\":" + String(ok ? 1 : 0) + ",\"age\":" + String(now - p.s.ts) +
+             "\",\"ok\":" + String(ok ? 1 : 0) + ",\"age\":" + String(p.s.valid ? (int32_t)(now - p.s.ts) : -1) +
              ",\"soc\":" + String(p.s.soc) + ",\"v\":" + String(p.s.packV, 2) +
              ",\"busv\":" + String(p.s.busV, 2) +
              ",\"i\":" + String(p.s.current, 2) + ",\"soh\":" + String(p.s.soh) +
@@ -1093,6 +1116,14 @@ void setup() {
 
     ArduinoOTA.setHostname("esm-bank");
     ArduinoOTA.setPassword(OTA_PASS);
+    ArduinoOTA.onStart([]() {
+        if (esmH)  vTaskSuspend(esmH);
+        if (deyeH) vTaskSuspend(deyeH);
+    });
+    ArduinoOTA.onError([](ota_error_t) {
+        if (esmH)  vTaskResume(esmH);
+        if (deyeH) vTaskResume(deyeH);
+    });
     ArduinoOTA.begin();
 
     web.on("/", []() { web.send(200, "text/html; charset=utf-8", htmlPage()); });

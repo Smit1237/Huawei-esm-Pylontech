@@ -49,6 +49,10 @@ public:
     // period.
     bool wake();
 
+    // Fast single-shot probe (400 ms) for multi-pack polling so an offline pack
+    // never stalls the remaining healthy packs on the shared bus.
+    bool ping(uint32_t timeoutMs = 400);
+
     // Three-step unlock: FC03 0x0106, then FC10 time sync, then FC41 access.
     // Run this again after each communication loss or battery reset.
     bool authenticate();

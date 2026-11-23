@@ -284,8 +284,8 @@ void loop() {
     // push cannot delay an inverter reply.
     if (now - lastDisp >= 400) {
         lastDisp = now;
-        uint32_t cc = s.ccl_coef ? s.ccl_coef : 100;
-        uint32_t dc = s.dcl_coef ? s.dcl_coef : 100;
+        uint16_t effCcl = 0, effDcl = 0;
+        PylontechEmu::effectiveLimits(s, effCcl, effDcl);
         TranslatorView tv;
         tv.packValid = fresh;
         tv.esmState  = (const char *)g_esmState;
@@ -296,9 +296,9 @@ void loop() {
         tv.deyeAnswered = deye.answered;
         tv.deyeAgeMs = deye.lastPollMs ? (now - deye.lastPollMs) : UINT32_MAX;
         tv.deyeCid2  = deye.lastCid2[0] ? deye.lastCid2 : "-";
-        tv.haveLimits = fresh && s.ccl_raw;
-        tv.cclEff = (s.ccl_raw * cc / 100) / 10.0f;
-        tv.dclEff = (s.dcl_raw * dc / 100) / 10.0f;
+        tv.haveLimits = fresh && s.haveLimits;
+        tv.cclEff = effCcl / 10.0f;
+        tv.dclEff = effDcl / 10.0f;
         tv.esmTx = esm.txBytes;
         tv.esmRx = esm.rxBytes;
         displayTranslator(tv);

@@ -159,12 +159,11 @@ void PylontechEmu::buildCmd62(const PackSnapshot &s, char *out, size_t n) {
     snprintf(out, n, "%02X%02X%02X%02X", alarm1, alarm2, prot1, prot2);
 }
 
-void PylontechEmu::buildCmd63(const PackSnapshot &s, char *out, size_t n) {
+void PylontechEmu::effectiveLimits(const PackSnapshot &s, uint16_t &cclDaOut, uint16_t &dclDaOut) {
     uint16_t maxc, minc;
     cellExtremes(s, maxc, minc);
+    uint32_t np = s.nPacks ? s.nPacks : 1;
 
-    uint32_t cvl_mv = (uint32_t)(s.cvl_raw ? s.cvl_raw : 540) * 100;
-    uint32_t dvl_mv = (uint32_t)(s.dvl_raw ? s.dvl_raw : 475) * 100;
     uint32_t ccl_da = s.haveLimits ? s.ccl_raw : 0;
     uint32_t dcl_da = s.haveLimits ? s.dcl_raw : 0;
 
@@ -174,22 +173,40 @@ void PylontechEmu::buildCmd63(const PackSnapshot &s, char *out, size_t n) {
     if (cclC > 0) ccl_da = ccl_da * cclC / 100;
     if (dclC > 0) dcl_da = dcl_da * dclC / 100;
 
-    // LiFePO4 cell-voltage & temperature protection envelopes
+    // LiFePO4 cell-voltage & temperature protection envelopes (scaled by active parallel pack count)
     bool hardFault = (s.sysFault | s.cellFault | s.prot) != 0;
     if (hardFault || s.tmax >= 55 || s.tmin <= 0 || (s.nCells && maxc >= 3620) || s.fullStop) {
         ccl_da = 0;
     } else {
-        // Cold temperature charge derate
-        if (s.tmin <= 5 && ccl_da > 100)       ccl_da = 100; // <=5C: max 10A
-        else if (s.tmin <= 12 && ccl_da > 300) ccl_da = 300; // <=12C: max 30A
-        // High cell voltage top-of-charge taper (15S LiFePO4)
-        if (s.nCells && maxc >= 3550 && ccl_da > 50)       ccl_da = 50;  // >=3.55V: 5A balance taper
-        else if (s.nCells && maxc >= 3500 && ccl_da > 150) ccl_da = 150; // >=3.50V: 15A taper
+        // Cold temperature charge derate (0.1C at <=5C, 0.3C at <=12C per 100Ah pack)
+        uint32_t cold5  = 100 * np;   // 10.0 A * nPacks
+        uint32_t cold12 = 300 * np;   // 30.0 A * nPacks
+        if (s.tmin <= 5 && ccl_da > cold5)        ccl_da = cold5;
+        else if (s.tmin <= 12 && ccl_da > cold12) ccl_da = cold12;
+
+        // High cell voltage top-of-charge taper (15S LiFePO4: 0.05C at >=3.55V, 0.15C at >=3.50V)
+        uint32_t tap355 = 50 * np;    // 5.0 A * nPacks
+        uint32_t tap350 = 150 * np;   // 15.0 A * nPacks
+        if (s.nCells && maxc >= 3550 && ccl_da > tap355)       ccl_da = tap355;
+        else if (s.nCells && maxc >= 3500 && ccl_da > tap350)  ccl_da = tap350;
     }
 
     if ((s.sysFault | s.cellFault) != 0 || s.tmax >= 58 || (s.nCells && minc <= 2800)) {
         dcl_da = 0;
     }
+
+    cclDaOut = ccl_da > 65535 ? 65535 : (uint16_t)ccl_da;
+    dclDaOut = dcl_da > 65535 ? 65535 : (uint16_t)dcl_da;
+}
+
+void PylontechEmu::buildCmd63(const PackSnapshot &s, char *out, size_t n) {
+    uint16_t maxc, minc;
+    cellExtremes(s, maxc, minc);
+
+    uint32_t cvl_mv = (uint32_t)(s.cvl_raw ? s.cvl_raw : 540) * 100;
+    uint32_t dvl_mv = (uint32_t)(s.dvl_raw ? s.dvl_raw : 475) * 100;
+    uint16_t ccl_da = 0, dcl_da = 0;
+    effectiveLimits(s, ccl_da, dcl_da);
 
     // Dynamic Pylontech 0x63 management flags:
     // bit7 = Charge Enable, bit6 = Discharge Enable, bit5 = Force Charge Request
@@ -200,7 +217,7 @@ void PylontechEmu::buildCmd63(const PackSnapshot &s, char *out, size_t n) {
 
     snprintf(out, n, "%04X%04X%04X%04X%02X",
              (unsigned)(cvl_mv & 0xFFFF), (unsigned)(dvl_mv & 0xFFFF),
-             (unsigned)(ccl_da & 0xFFFF), (unsigned)(dcl_da & 0xFFFF), status);
+             (unsigned)ccl_da, (unsigned)dcl_da, status);
 }
 
 static int hexByte(char hi, char lo) {

@@ -142,6 +142,11 @@ bool HuaweiESM::wake() {
     return fc03(0x0000, 1, &v, 800);
 }
 
+bool HuaweiESM::ping(uint32_t timeoutMs) {
+    uint16_t v = 0;
+    return fc03(0x0000, 1, &v, timeoutMs) && v > 0;
+}
+
 bool HuaweiESM::readClock(uint16_t out[6]) {
     return fc03(0x1000, 6, out);
 }

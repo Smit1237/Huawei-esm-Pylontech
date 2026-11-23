@@ -10,6 +10,7 @@ struct PackSnapshot {
     bool     valid      = false;
     bool     haveLimits = false;
     bool     fullStop   = false; // hysteresis latch when 100% full & idle
+    uint8_t  nPacks     = 1;     // active parallel packs represented by this snapshot
     float    packV      = 0;     // V
     float    current    = 0;     // A, + = charge (ESM native sign)
     uint8_t  soc        = 0;     // % (SOH-weighted rounded average in bank mode)
@@ -18,14 +19,14 @@ struct PackSnapshot {
     int16_t  tmin       = 0;     // degC
     int16_t  tmax       = 0;     // degC
     float    tavg       = NAN;   // degC true mean across all NTCs (NAN = compute from ctemps[])
-    uint16_t cells[15];          // mV
+    uint16_t cells[15]{};        // mV
     uint8_t  nCells     = 0;
     uint16_t maxSpread  = 0xFFFF;// max within-pack cell delta in mV (0xFFFF = compute from cells[])
     uint8_t  maxCellPack = 1, maxCellIdx = 0; // 1-based Pylontech coordinates
     uint8_t  minCellPack = 1, minCellIdx = 0;
     uint8_t  maxTempPack = 1, maxTempIdx = 0;
     uint8_t  minTempPack = 1, minTempIdx = 0;
-    int16_t  ctemps[16];         // degC (Huawei NTC sensors)
+    int16_t  ctemps[16]{};       // degC (Huawei NTC sensors)
     uint8_t  nTemps     = 0;
     uint16_t cycles     = 0;     // max cycles
     uint16_t cyclesAvg  = 0;     // average cycles (0 = same as cycles)
@@ -55,6 +56,10 @@ public:
     // Read all data that the inverter sent. Answer each frame with our address.
     // This call is cheap and non-blocking. Call it as often as possible.
     void poll(const PackSnapshot &s);
+
+    // Single source of truth for effective CCL/DCL (0.1 A units) so WebUI, MQTT,
+    // T-Display, and Pylontech 0x63 always report identical current limits.
+    static void effectiveLimits(const PackSnapshot &s, uint16_t &cclDaOut, uint16_t &dclDaOut);
 
     uint32_t answered   = 0;
     uint32_t badFrames  = 0;
