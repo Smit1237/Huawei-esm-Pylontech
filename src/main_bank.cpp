@@ -62,7 +62,7 @@
 // Increase this on each build. Then you can confirm the live image in the
 // WebUI header and the serial banner. This proves that an OTA push worked.
 #ifndef FW_VERSION
-#define FW_VERSION "bank-2.5"
+#define FW_VERSION "bank-2.5.1"
 #endif
 #ifndef ESM_TX_PIN
 #define ESM_TX_PIN 33
@@ -1000,7 +1000,7 @@ static String htmlPage() {
                  "<style>body{font-family:system-ui;margin:16px;max-width:700px}"
                  "table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:4px 6px;font-size:13px;text-align:right}"
                  "th:first-child,td:first-child{text-align:left}input,select{padding:4px 6px;margin:3px 0}fieldset{margin:12px 0}"
-                 ".lbl{display:inline-block;min-width:110px}.b{font-size:22px;font-weight:bold;margin:8px 0 4px}"
+                 ".lbl{display:inline-block;min-width:128px}.b{font-size:22px;font-weight:bold;margin:8px 0 4px}"
                  ".pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;font-weight:600}</style>"
                  "<h2>ESM bank <span style='font-size:13px;color:#888;font-weight:normal'>fw " FW_VERSION "</span></h2>");
     if (apMode) {
@@ -1128,10 +1128,10 @@ static String htmlPage() {
            "<span style='color:#777;font-size:12px'>(Solar Follow-Float target, e.g. 50.1 V = 3.34 V/cell for 15S)</span><br>"
            "<span class=lbl>Periodic Rebulk</span><input name=rbdays type=number min=0 max=60 value='%RBDAYS%' style='width:58px'> days "
            "<span style='color:#777;font-size:12px'>(top-balance interval if parked continuously; 0 = disabled)</span><br>"
-           "<span class=lbl>Deye Cycles</span><select name=ahcyc>"
+           "<span class=lbl>Pylontech Cycles</span><select name=ahcyc>"
            "<option value=1 %AH1%>True Ah-Equivalent Cycles (ahTotal / 100 Ah &mdash; Recommended)</option>"
            "<option value=0 %AH0%>Huawei Raw Event Counter (0x0042)</option>"
-           "</select>"
+           "</select> <span style='color:#777;font-size:12px'>(reported in Pylontech 0x61 &amp; MQTT)</span>"
            "</fieldset>"
            "<fieldset><legend>WiFi (NVS Persistent)</legend>"
            "<span class=lbl>SSID</span><input name=wssid value='%WSSID%' size=28 maxlength=32><br>"
