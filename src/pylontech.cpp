@@ -75,7 +75,7 @@ void PylontechEmu::buildCmd61(const PackSnapshot &s, char *out, size_t n) {
     uint8_t  soc    = s.soc;
     uint8_t  avgSoh = s.soh;
     uint8_t  minSoh = s.sohMin ? s.sohMin : avgSoh;
-    uint16_t maxCyc = s.cycles ? s.cycles : 100;
+    uint16_t maxCyc = s.cycles;
     uint16_t avgCyc = s.cyclesAvg ? s.cyclesAvg : maxCyc;
 
     uint16_t maxc, minc;
@@ -215,7 +215,8 @@ void PylontechEmu::effectiveLimits(const PackSnapshot &s, uint16_t &cclDaOut, ui
             else if (maxc >= 3500) capChgC(15);  // >= 3.50 V -> 0.15C (15 A/pack)
             else if (maxc >= 3450) capChgC(30);  // >= 3.45 V -> 0.30C (30 A/pack)
         }
-        if (s.soc >= 100)      capChgC(5);       // 100% SOC  -> 0.05C (5 A/pack absorption finish)
+        if (s.floatMode)       capChgC(10);      // Float phase -> 0.10C (10 A/pack gentle bus support)
+        if (s.soc >= 100)      capChgC(5);       // 100% SOC  -> 0.05C (5 A/pack absorption/float finish)
         else if (s.soc >= 99)  capChgC(20);      // 99% SOC   -> 0.20C (20 A/pack)
         else if (s.soc >= 98)  capChgC(50);      // 98% SOC   -> 0.50C (50 A/pack)
     }

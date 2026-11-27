@@ -9,7 +9,8 @@
 struct PackSnapshot {
     bool     valid      = false;
     bool     haveLimits = false;
-    bool     fullStop   = false; // hysteresis latch when 100% full & idle
+    bool     fullStop   = false; // EOC Stop latch (UPS mode: CCL = 0 A until Rebulk)
+    bool     floatMode  = false; // Follow-Float CVL active (Solar mode: reduced CVL + gentle CCL)
     uint8_t  nPacks     = 1;     // active parallel packs represented by this snapshot
     uint16_t capAh      = 0;     // nominal pack capacity from 0x0107 in Ah (0 = default 100 Ah ESM-48100B1)
     float    packV      = 0;     // V
@@ -29,8 +30,12 @@ struct PackSnapshot {
     uint8_t  minTempPack = 1, minTempIdx = 0;
     int16_t  ctemps[16]{};       // degC (Huawei NTC sensors)
     uint8_t  nTemps     = 0;
-    uint16_t cycles     = 0;     // max cycles
-    uint16_t cyclesAvg  = 0;     // average cycles (0 = same as cycles)
+    uint16_t cycles     = 0;     // max cycles reported to Pylontech 0x61
+    uint16_t cyclesAvg  = 0;     // average cycles reported to Pylontech 0x61 (0 = same as cycles)
+    uint16_t efcCycles    = 0;   // true full-equivalent cycles (ahTotal / capAh) max
+    uint16_t efcCyclesAvg = 0;   // true full-equivalent cycles average
+    uint16_t rawCycles    = 0;   // raw Huawei 0x0042 event counter max
+    uint16_t rawCyclesAvg = 0;   // raw Huawei 0x0042 event counter average
     // Raw limit registers of the pack (0x100A block)
     uint16_t cvl_raw    = 0;     // 0.1 V  charge voltage
     uint16_t dvl_raw    = 0;     // 0.1 V  discharge cutoff
