@@ -133,28 +133,33 @@ void PylontechEmu::buildCmd62(const PackSnapshot &s, char *out, size_t n) {
 
     uint8_t alarm1 = 0, alarm2 = 0, prot1 = 0, prot2 = 0;
 
-    // Alarm Status 1 (matches Pylontech 0x62 layout)
-    if (s.packV >= 55.5f)                               alarm1 |= (1 << 7); // Total V High
-    if (s.packV > 10.0f && s.packV <= 47.5f)            alarm1 |= (1 << 6); // Total V Low
-    if (s.nCells && maxc >= 3600)                       alarm1 |= (1 << 5); // Cell V High
-    if (s.nCells && minc <= 2950)                       alarm1 |= (1 << 4); // Cell V Low
-    if (s.tmax >= 50)                                   alarm1 |= (1 << 3); // Cell Temp High
-    if (s.tmin <= 2)                                    alarm1 |= (1 << 2); // Cell Temp Low
-    if (spread >= 300)                                  alarm1 |= (1 << 0); // Within-pack Cell Imbalance >= 300mV
+    // Alarm Status 1 — aligned with Huawei ESM-48100B1 BMS thresholds (0x1200..0x122F, 0x0049)
+    if (s.packV >= 56.4f || (s.warn & (1 << 4)))                   alarm1 |= (1 << 7); // Pack V High (56.4V manual / 0x0049_4)
+    if ((s.packV > 10.0f && s.packV <= 47.5f) || (s.warn & (1 << 6))) alarm1 |= (1 << 6); // Pack V Low (47.5V DVL / 0x0049_6)
+    if ((s.nCells && maxc >= 3600) || (s.warn & (1 << 5)))         alarm1 |= (1 << 5); // Cell V High (0x1200 = 3600mV / 0x0049_5)
+    if ((s.nCells && minc <= 3000) || (s.warn & (1 << 7)))         alarm1 |= (1 << 4); // Cell V Low  (0x1203 = 3000mV / 0x0049_7)
+    if (s.tmax >= 50 || (s.warn & ((1 << 1) | (1 << 3))))          alarm1 |= (1 << 3); // Temp High   (0x1220/0x1228 = 50C)
+    if (s.tmin <= 0  || (s.warn & ((1 << 0) | (1 << 2))))          alarm1 |= (1 << 2); // Temp Low    (0x122B = 0C / 0x0049_0,2)
+    if (spread >= 300)                                             alarm1 |= (1 << 0); // Within-pack Cell Imbalance >= 300mV
 
-    // Alarm Status 2
-    if (s.warn != 0)                                    alarm2 |= (1 << 3); // Pack warning active
+    // Alarm Status 2 — Huawei OC warnings (0x004A) & general BMS warnings (0x0049)
+    if (s.special & (1 << 10))                                     alarm2 |= (1 << 0); // Charge OC Alarm (0x004A_10)
+    if (s.special & (1 << 4))                                      alarm2 |= (1 << 1); // Discharge OC Alarm (0x004A_4)
+    if (s.warn != 0)                                               alarm2 |= (1 << 3); // Pack warning active
 
-    // Protection Status 1
-    if (s.packV >= 56.5f)                               prot1  |= (1 << 7); // Module OV Prot
-    if (s.packV > 10.0f && s.packV <= 45.0f)            prot1  |= (1 << 6); // Module UV Prot
-    if (s.nCells && maxc >= 3650)                       prot1  |= (1 << 5); // Cell OV Prot
-    if (s.nCells && minc <= 2800)                       prot1  |= (1 << 4); // Cell UV Prot
-    if (s.tmax >= 55)                                   prot1  |= (1 << 3); // Cell OT Prot
-    if (s.tmin <= -5)                                   prot1  |= (1 << 2); // Cell UT Prot
+    // Protection Status 1 — aligned with Huawei ESM-48100B1 BMS protections (0x1204..0x122F, 0x0048)
+    if (s.packV >= 57.6f || (s.prot & ((1 << 4) | (1 << 8))))      prot1  |= (1 << 7); // Pack OV Prot (0x1214 = 57.6V / 0x0048_4,8)
+    if ((s.packV > 10.0f && s.packV <= 43.2f) || (s.prot & ((1 << 6) | (1 << 11)))) prot1 |= (1 << 6); // Pack UV Prot (0x1217 = 43.2V)
+    if ((s.nCells && maxc >= 3800) || (s.prot & (1 << 5)))         prot1  |= (1 << 5); // Cell OV Prot (0x1204 = 3900mV / 0x0048_5)
+    if ((s.nCells && minc <= 2500) || (s.prot & (1 << 7)))         prot1  |= (1 << 4); // Cell UV Prot (0x1207 = 2500mV / 0x0048_7)
+    if (s.tmax >= 60 || (s.prot & ((1 << 1) | (1 << 3) | (1 << 9)))) prot1 |= (1 << 3); // Cell/MOS OT Prot (0x1224 = 60C)
+    if (s.tmin <= -20 || (s.prot & ((1 << 0) | (1 << 2))))         prot1  |= (1 << 2); // Cell UT Prot (0x1227 = 0C chg / 0x122F = -20C dis)
 
-    // Protection Status 2
-    if ((s.sysFault | s.cellFault | s.prot) != 0)       prot2  |= (1 << 3); // Hardware / BMS Fault
+    // Protection Status 2 — Huawei OC, SC & hardware faults (0x0046, 0x0047, 0x0048, 0x004A)
+    if (s.special & (1 << 11))                                     prot2  |= (1 << 0); // Charge OC Prot (0x004A_11)
+    if ((s.special & ((1 << 5) | (1 << 6))) || (s.prot & (1 << 14))) prot2 |= (1 << 1); // Discharge OC / Overload Prot
+    if ((s.prot & (1 << 10)) || (s.sysFault & (1 << 3)) || (s.special & (1 << 13))) prot2 |= (1 << 2); // Short Circuit Prot
+    if ((s.sysFault | s.cellFault) != 0 || (s.prot & 0x3000) != 0) prot2  |= (1 << 3); // Hardware / Cell / Lock Fault
 
     snprintf(out, n, "%02X%02X%02X%02X", alarm1, alarm2, prot1, prot2);
 }
@@ -164,35 +169,85 @@ void PylontechEmu::effectiveLimits(const PackSnapshot &s, uint16_t &cclDaOut, ui
     cellExtremes(s, maxc, minc);
     uint32_t np = s.nPacks ? s.nPacks : 1;
 
-    uint32_t ccl_da = s.haveLimits ? s.ccl_raw : 0;
-    uint32_t dcl_da = s.haveLimits ? s.dcl_raw : 0;
+    // Official Huawei ESM-48100B1 datasheet rating:
+    //   Nominal capacity = 100 Ah (0x0107), Max charge/discharge current limited = 100.0 A (1.0C) @ 35 C.
+    //   BMS 0x100D/0x100B read 1020 (102.0 A = 102% hardware OC margin at 0x1274); cap to 1.0C manual spec
+    //   while still honoring any lower user-configured limit in 0x100D/0x100B.
+    //   Note: 0x1018 (=85) is NOT a discharge coefficient in Huawei's register map (oficial1.xml).
+    uint32_t capDa  = (uint32_t)(s.capAh ? s.capAh : 100) * 10; // 1000 (100.0 A) per 100 Ah pack
+    uint32_t bankDa = capDa * np;                               // 1.0C ceiling across active packs
 
-    // Apply Huawei NVRAM coef when configured (1..100%); 0 in Huawei 0x1011 means unconfigured
-    uint16_t cclC = s.ccl_coef > 100 ? 100 : s.ccl_coef;
-    uint16_t dclC = s.dcl_coef > 100 ? 100 : s.dcl_coef;
-    if (cclC > 0) ccl_da = ccl_da * cclC / 100;
-    if (dclC > 0) dcl_da = dcl_da * dclC / 100;
+    uint32_t ccl_da = s.haveLimits ? min<uint32_t>(s.ccl_raw, bankDa) : 0;
+    uint32_t dcl_da = s.haveLimits ? min<uint32_t>(s.dcl_raw, bankDa) : 0;
 
-    // LiFePO4 cell-voltage & temperature protection envelopes (scaled by active parallel pack count)
-    bool hardFault = (s.sysFault | s.cellFault | s.prot) != 0;
-    if (hardFault || s.tmax >= 55 || s.tmin <= 0 || (s.nCells && maxc >= 3620) || s.fullStop) {
+    // Direction-specific Huawei protection masks (oficial1.xml 0x0048 & 0x004A) so an undervoltage
+    // trip never blocks charging, and an overvoltage trip never blocks discharging.
+    static constexpr uint16_t PROT_CHG_MASK = 0x7733; // Chg UT/OT, Pack/Cell/Out OV, Mod OT, SC, Rev, Lock, Overload
+    static constexpr uint16_t PROT_DIS_MASK = 0x7ECC; // Dis UT/OT, Pack/Cell/LVD UV, Mod OT, SC, Rev, Lock, Overload
+    static constexpr uint16_t SPEC_CHG_MASK = 0x288B; // Cmd/Abn shutdown, VBUS OV/lock, Chg OC prot, FET short
+    static constexpr uint16_t SPEC_DIS_MASK = 0x206B; // Cmd/Abn shutdown, VBUS lock, Dis OC prot/lock, FET short
+
+    bool hwFault  = (s.sysFault | s.cellFault) != 0;
+    bool chgBlock = hwFault || (s.prot & PROT_CHG_MASK) != 0 || (s.special & SPEC_CHG_MASK) != 0;
+    bool disBlock = hwFault || (s.prot & PROT_DIS_MASK) != 0 || (s.special & SPEC_DIS_MASK) != 0;
+
+    // 1. CHARGE ENVELOPE — Huawei Manual: Operating Temp 0 C..45 C (0x1227 = 0.0 C UT protect),
+    //    rated 100 A @ 35 C, Cell High-Voltage Alarm 0x1200 = 3600 mV.
+    if (chgBlock || s.tmin <= 0 || s.tmax > 45 || (s.nCells && maxc >= 3600) || s.fullStop) {
         ccl_da = 0;
     } else {
-        // Cold temperature charge derate (0.1C at <=5C, 0.3C at <=12C per 100Ah pack)
-        uint32_t cold5  = 100 * np;   // 10.0 A * nPacks
-        uint32_t cold12 = 300 * np;   // 30.0 A * nPacks
-        if (s.tmin <= 5 && ccl_da > cold5)        ccl_da = cold5;
-        else if (s.tmin <= 12 && ccl_da > cold12) ccl_da = cold12;
+        auto capChgC = [&](uint32_t centiC) {
+            uint32_t lim = bankDa * centiC / 100;
+            if (ccl_da > lim) ccl_da = lim;
+        };
+        // Cold charge derating aligned with Huawei 0x1223 (5 C alarm) & 0x1222 (8 C restore)
+        if (s.tmin <= 5)       capChgC(10);  // 1..5 C  -> 0.10C (10 A/pack)
+        else if (s.tmin <= 8)  capChgC(20);  // 6..8 C  -> 0.20C (20 A/pack)
+        else if (s.tmin <= 12) capChgC(50);  // 9..12 C -> 0.50C (50 A/pack)
 
-        // High cell voltage top-of-charge taper (15S LiFePO4: 0.05C at >=3.55V, 0.15C at >=3.50V)
-        uint32_t tap355 = 50 * np;    // 5.0 A * nPacks
-        uint32_t tap350 = 150 * np;   // 15.0 A * nPacks
-        if (s.nCells && maxc >= 3550 && ccl_da > tap355)       ccl_da = tap355;
-        else if (s.nCells && maxc >= 3500 && ccl_da > tap350)  ccl_da = tap350;
+        // Warm charge derating above 35 C rated point up to 45 C manual limit (Note 3)
+        if (s.tmax >= 41)      capChgC(30);  // 41..45 C -> 0.30C (30 A/pack)
+        else if (s.tmax >= 36) capChgC(50);  // 36..40 C -> 0.50C (50 A/pack)
+
+        // Top-of-charge cell-voltage & SOC taper approaching 0x1200 = 3600 mV (CVL = 54.0 V)
+        if (s.nCells) {
+            if (maxc >= 3550)      capChgC(5);   // >= 3.55 V -> 0.05C (5 A/pack)
+            else if (maxc >= 3500) capChgC(15);  // >= 3.50 V -> 0.15C (15 A/pack)
+            else if (maxc >= 3450) capChgC(30);  // >= 3.45 V -> 0.30C (30 A/pack)
+        }
+        if (s.soc >= 100)      capChgC(5);       // 100% SOC  -> 0.05C (5 A/pack absorption finish)
+        else if (s.soc >= 99)  capChgC(20);      // 99% SOC   -> 0.20C (20 A/pack)
+        else if (s.soc >= 98)  capChgC(50);      // 98% SOC   -> 0.50C (50 A/pack)
     }
 
-    if ((s.sysFault | s.cellFault) != 0 || s.tmax >= 58 || (s.nCells && minc <= 2800)) {
+    // 2. DISCHARGE ENVELOPE — Huawei Manual: Operating Temp -20 C..45 C (0x122F = -20.0 C UT protect,
+    //    0x122B = 0.0 C low-temp alarm, 0x1228 = 50.0 C high-temp alarm), Default LVD = 46.0 V,
+    //    Cell LV ladder: 0x1202 = 3100 mV, 0x1203 = 3000 mV, 0x1206 = 2900 mV, 0x1217 = 43.2 V.
+    if (disBlock || s.tmin <= -20 || s.tmax >= 55 ||
+        (s.nCells && minc <= 2800) || (s.packV > 10.0f && s.packV <= 43.5f)) {
         dcl_da = 0;
+    } else {
+        auto capDisC = [&](uint32_t centiC) {
+            uint32_t lim = bankDa * centiC / 100;
+            if (dcl_da > lim) dcl_da = lim;
+        };
+        // Sub-zero / cold discharge derating (Note 3, 0x122B = 0 C alarm, 0x122F = -20 C protect)
+        if (s.tmin <= -10)     capDisC(20);  // -19..-10 C -> 0.20C (20 A/pack)
+        else if (s.tmin <= 0)  capDisC(50);  //  -9..0 C   -> 0.50C (50 A/pack)
+
+        // High-temperature discharge derating (Note 3 & 4: rated 100 A @ 35 C, max op 45 C, 50 C alarm)
+        if (s.tmax >= 50)      capDisC(20);  // 50..54 C -> 0.20C (20 A/pack)
+        else if (s.tmax >= 46) capDisC(30);  // 46..49 C -> 0.30C (30 A/pack)
+        else if (s.tmax >= 40) capDisC(70);  // 40..45 C -> 0.70C (70 A/pack)
+
+        // Dynamic low-voltage & low-SOC discharge taper (Huawei 0x1202/0x1203/0x1206 & 46.0 V LVD)
+        if ((s.nCells && minc <= 2900) || (s.packV > 10.0f && s.packV <= 46.0f) || s.soc <= 2) {
+            capDisC(10);                     // <= 2.90 V / <= 46.0 V / <= 2%  -> 0.10C (10 A/pack)
+        } else if ((s.nCells && minc <= 3000) || (s.packV > 10.0f && s.packV <= 47.0f) || s.soc <= 5) {
+            capDisC(20);                     // <= 3.00 V / <= 47.0 V / <= 5%  -> 0.20C (20 A/pack)
+        } else if ((s.nCells && minc <= 3100) || s.soc <= 10) {
+            capDisC(50);                     // <= 3.10 V / <= 10% SOC         -> 0.50C (50 A/pack)
+        }
     }
 
     cclDaOut = ccl_da > 65535 ? 65535 : (uint16_t)ccl_da;
@@ -203,17 +258,18 @@ void PylontechEmu::buildCmd63(const PackSnapshot &s, char *out, size_t n) {
     uint16_t maxc, minc;
     cellExtremes(s, maxc, minc);
 
+    // Honor pack's configured 0x100A (54.0 V) & 0x100E (47.5 V); fallback to 54.0 V / 46.0 V (Huawei manual LVD)
     uint32_t cvl_mv = (uint32_t)(s.cvl_raw ? s.cvl_raw : 540) * 100;
-    uint32_t dvl_mv = (uint32_t)(s.dvl_raw ? s.dvl_raw : 475) * 100;
+    uint32_t dvl_mv = (uint32_t)(s.dvl_raw ? s.dvl_raw : 460) * 100;
     uint16_t ccl_da = 0, dcl_da = 0;
     effectiveLimits(s, ccl_da, dcl_da);
 
     // Dynamic Pylontech 0x63 management flags:
-    // bit7 = Charge Enable, bit6 = Discharge Enable, bit5 = Force Charge Request
+    // bit7 = Charge Enable, bit6 = Discharge Enable, bit5 = Force Charge Request (at Huawei 0x1203 3000mV or <=5% SOC)
     uint8_t status = 0;
     if (ccl_da > 0) status |= 0x80;
     if (dcl_da > 0) status |= 0x40;
-    if (s.soc <= 5 || (s.nCells && minc <= 2950)) status |= 0x20;
+    if (s.soc <= 5 || (s.nCells && minc <= 3000) || (s.packV > 10.0f && s.packV <= 46.0f)) status |= 0x20;
 
     snprintf(out, n, "%04X%04X%04X%04X%02X",
              (unsigned)(cvl_mv & 0xFFFF), (unsigned)(dvl_mv & 0xFFFF),

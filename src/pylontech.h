@@ -11,6 +11,7 @@ struct PackSnapshot {
     bool     haveLimits = false;
     bool     fullStop   = false; // hysteresis latch when 100% full & idle
     uint8_t  nPacks     = 1;     // active parallel packs represented by this snapshot
+    uint16_t capAh      = 0;     // nominal pack capacity from 0x0107 in Ah (0 = default 100 Ah ESM-48100B1)
     float    packV      = 0;     // V
     float    current    = 0;     // A, + = charge (ESM native sign)
     uint8_t  soc        = 0;     // % (SOH-weighted rounded average in bank mode)
@@ -33,10 +34,10 @@ struct PackSnapshot {
     // Raw limit registers of the pack (0x100A block)
     uint16_t cvl_raw    = 0;     // 0.1 V  charge voltage
     uint16_t dvl_raw    = 0;     // 0.1 V  discharge cutoff
-    uint16_t ccl_raw    = 0;     // 0.1 A  charge current
-    uint16_t dcl_raw    = 0;     // 0.1 A  discharge current
-    uint16_t ccl_coef   = 0;     // %      0x1011 (0 = unconfigured in Huawei NVRAM)
-    uint16_t dcl_coef   = 0;     // %      0x1018
+    uint16_t ccl_raw    = 0;     // 0.1 A  charge current (0x100D)
+    uint16_t dcl_raw    = 0;     // 0.1 A  discharge current (0x100B)
+    uint16_t ccl_coef   = 0;     // raw 0x1011 diagnostic word (not a % derate)
+    uint16_t dcl_coef   = 0;     // raw 0x1018 diagnostic word (not a % derate)
     // Extended telemetry & Huawei fault/status words
     float    busV       = 0;     // busbar voltage, register 0x0000 (V)
     uint32_t ahTotal    = 0;     // lifetime Ah throughput (register 0x0044)

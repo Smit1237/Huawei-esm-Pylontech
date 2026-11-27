@@ -212,8 +212,8 @@ bool HuaweiESM::authenticate() {
     return true;
 }
 
-bool HuaweiESM::readRegisters(uint16_t startReg, uint16_t count, uint16_t *out) {
-    return fc03(startReg, count, out);
+bool HuaweiESM::readRegisters(uint16_t startReg, uint16_t count, uint16_t *out, uint32_t timeoutMs) {
+    return fc03(startReg, count, out, timeoutMs);
 }
 
 bool HuaweiESM::readMainData(EsmMainData &out) {
