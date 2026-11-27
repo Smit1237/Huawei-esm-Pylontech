@@ -212,8 +212,47 @@ bool HuaweiESM::authenticate() {
     return true;
 }
 
-bool HuaweiESM::readRegisters(uint16_t startReg, uint16_t count, uint16_t *out) {
-    return fc03(startReg, count, out);
+bool HuaweiESM::readRegisters(uint16_t startReg, uint16_t count, uint16_t *out, uint32_t timeoutMs) {
+    return fc03(startReg, count, out, timeoutMs);
+}
+
+bool HuaweiESM::writeRegister(uint16_t reg, uint16_t val, uint8_t *excOut, uint32_t timeoutMs) {
+    if (excOut) *excOut = 0;
+    uint8_t req[6] = { _addr, 0x06,
+                       (uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF),
+                       (uint8_t)(val >> 8), (uint8_t)(val & 0xFF) };
+    uint8_t resp[16];
+    size_t len = transact(req, sizeof(req), resp, sizeof(resp), timeoutMs);
+    if (len >= 5 && resp[1] == 0x86) {
+        if (excOut) *excOut = resp[2];
+        return false;
+    }
+    return len >= 8 && memcmp(resp, req, 6) == 0;
+}
+
+bool HuaweiESM::writeRegisters(uint16_t startReg, uint16_t count, const uint16_t *vals,
+                               uint8_t *excOut, uint32_t timeoutMs) {
+    if (excOut) *excOut = 0;
+    if (count == 0 || count > 24) return false;
+    uint8_t req[7 + 48];
+    req[0] = _addr;
+    req[1] = 0x10;
+    req[2] = (uint8_t)(startReg >> 8);
+    req[3] = (uint8_t)(startReg & 0xFF);
+    req[4] = (uint8_t)(count >> 8);
+    req[5] = (uint8_t)(count & 0xFF);
+    req[6] = (uint8_t)(2 * count);
+    for (uint16_t i = 0; i < count; i++) {
+        req[7 + 2 * i]     = (uint8_t)(vals[i] >> 8);
+        req[7 + 2 * i + 1] = (uint8_t)(vals[i] & 0xFF);
+    }
+    uint8_t resp[16];
+    size_t len = transact(req, 7 + 2 * count, resp, sizeof(resp), timeoutMs);
+    if (len >= 5 && resp[1] == 0x90) {
+        if (excOut) *excOut = resp[2];
+        return false;
+    }
+    return len >= 8 && memcmp(resp, req, 6) == 0;
 }
 
 bool HuaweiESM::readMainData(EsmMainData &out) {

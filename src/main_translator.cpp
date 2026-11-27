@@ -176,6 +176,11 @@ static void esmTask(void *) {
             if (firstSlow || millis() - lastSlow > SLOW_MS) {
                 firstSlow = false;
                 lastSlow = millis();
+                if (!local.capAh) {
+                    uint16_t cap = 0;
+                    if (esm.readRegisters(0x0107, 1, &cap, 300) && cap >= 20 && cap <= 500) local.capAh = cap;
+                    else local.capAh = 100;
+                }
                 uint16_t mv[15]; int16_t t[16];
                 if (esm.readCells(mv, t)) {
                     local.nCells = 0;
@@ -208,8 +213,13 @@ static void esmTask(void *) {
                 }
             }
 
-            if (local.soc == 100 && fabsf(local.current) <= 0.3f) local.fullStop = true;
-            else if (local.soc <= 98 || local.current < -0.6f)    local.fullStop = false;
+            uint16_t minCell = 0xFFFF;
+            for (uint8_t i = 0; i < local.nCells; i++)
+                if (local.cells[i] < minCell) minCell = local.cells[i];
+            if (local.soc == 100 && fabsf(local.current) <= 0.5f && (minCell == 0xFFFF || minCell >= 3310))
+                local.fullStop = true;
+            else if (local.soc <= 96 || local.current < -1.0f || (minCell != 0xFFFF && minCell < 3280))
+                local.fullStop = false;
 
             local.valid = true;
             local.ts    = millis();
@@ -315,10 +325,14 @@ void loop() {
                       (unsigned long)deye.answered,
                       (unsigned long)(sincePoll / 1000),
                       deye.lastCid2[0] ? deye.lastCid2 : "-");
-        if (fresh && s.ccl_raw)
-            Serial.printf("[stat] limits: CVL %.1fV DVL %.1fV CCL %u(0.1A)x%u%% DCL %u(0.1A)x%u%%\n",
-                          s.cvl_raw * 0.1f, s.dvl_raw * 0.1f,
-                          s.ccl_raw, s.ccl_coef, s.dcl_raw, s.dcl_coef);
+        if (fresh && s.haveLimits) {
+            uint16_t effCcl = 0, effDcl = 0;
+            PylontechEmu::effectiveLimits(s, effCcl, effDcl);
+            Serial.printf("[stat] limits: CVL %.1fV DVL %.1fV CCL %.1fA (raw %u) DCL %.1fA (raw %u)\n",
+                          (s.cvl_raw ? s.cvl_raw : 540) * 0.1f,
+                          (s.dvl_raw ? s.dvl_raw : 460) * 0.1f,
+                          effCcl * 0.1f, s.ccl_raw, effDcl * 0.1f, s.dcl_raw);
+        }
     }
     delay(20);
 }

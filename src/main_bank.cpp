@@ -61,7 +61,7 @@
 // Increase this on each build. Then you can confirm the live image in the
 // WebUI header and the serial banner. This proves that an OTA push worked.
 #ifndef FW_VERSION
-#define FW_VERSION "bank-2.2"
+#define FW_VERSION "bank-2.3-exp"
 #endif
 #ifndef ESM_TX_PIN
 #define ESM_TX_PIN 33
@@ -89,12 +89,39 @@ PylontechEmu deye(Serial2, DEYE_ADDR);
 struct Pack {
     uint8_t  addr;
     bool     authed = false;
+    bool     audited = false;
     uint8_t  fails = 0;
     uint32_t nextProbeMs = 0; // cooldown before re-probing an offline pack
     char     serial[24] = "";
     PackSnapshot s;           // s.valid = fresh data. s.ts = time of last read.
 };
+
+// Read-only configuration & hardware parameter snapshot per pack (exposed at GET /audit)
+struct PackAudit {
+    bool     done = false;
+    uint32_t ts   = 0;
+    char     archive[512] = "";   // FC41 nameplate e-label (BoardType, Model, Description, Manufactured, etc.)
+    uint16_t sys[16]{};           // 0x0100..0x010F (SW ver 0x0101/0x0106, Capacity 0x0107, Cell count 0x010F)
+    uint32_t sysMask = 0;
+    uint16_t ctrl[22]{};          // 0x100A..0x101F (CVL/DCL/CCL/DVL, DO1/2, coefs, Default CCL 0x101B)
+    uint32_t ctrlMask = 0;
+    uint16_t cellV[8]{};          // 0x1200..0x1207 (Cell voltage alarm/protect/restore thresholds)
+    uint32_t cellVMask = 0;
+    uint16_t packV[8]{};          // 0x1210..0x1217 (Pack voltage alarm/protect/restore thresholds)
+    uint32_t packVMask = 0;
+    uint16_t tempLim[28]{};       // 0x1220..0x123B (Chg/Dis/Env/BMS temperature thresholds)
+    uint32_t tempLimMask = 0;
+    uint16_t currLim[15]{};       // 0x1270..0x127E (Chg/Dis OC alarm/protect/delays + 0x127E CCL setting)
+    uint32_t currLimMask = 0;
+    uint16_t funcSw[6]{};         // 0x12F0..0x12F5 (Voltage/Temp/Current/Capacity/Balance/LED switches)
+    uint32_t funcSwMask = 0;
+    uint16_t accCyc[2]{};         // 0x7D6B..0x7D6C (32-bit accumulated cycle times)
+    uint32_t accCycMask = 0;
+};
+
 static Pack pk[NUM_PACKS];
+static PackAudit pa[NUM_PACKS];
+static volatile bool g_auditRefresh = false;
 static PackSnapshot agg;                 // aggregate given to the Deye emulator
 static SemaphoreHandle_t mux;            // guards pk[] and agg
 static TaskHandle_t esmH = nullptr, deyeH = nullptr;  // suspended during a web OTA
@@ -368,7 +395,58 @@ static void extractSerial(const char *blob, char *out, size_t n) {
     out[i] = 0;
 }
 
-static void pollPack(Pack &p, bool deep) {
+static uint32_t readBlockSafe(uint16_t startReg, uint8_t count, uint16_t *out) {
+    memset(out, 0, count * sizeof(uint16_t));
+    if (esm.readRegisters(startReg, count, out, 500)) {
+        return (count == 32) ? 0xFFFFFFFFu : ((1u << count) - 1u);
+    }
+    // Fallback to per-register FC03 reads if an unimplemented gap register caused an exception
+    uint32_t mask = 0;
+    for (uint8_t i = 0; i < count; i++) {
+        uint16_t v = 0;
+        if (esm.readRegisters(startReg + i, 1, &v, 250)) {
+            out[i] = v;
+            mask |= (1u << i);
+        }
+    }
+    return mask;
+}
+
+static void auditPack(unsigned idx) {
+    Pack &p = pk[idx];
+    esm.setTarget(p.addr, false);
+    static PackAudit local;               // static inside single-threaded esmTask saves stack
+    memset(&local, 0, sizeof(local));
+    if (xSemaphoreTake(mux, pdMS_TO_TICKS(50)) == pdTRUE) {
+        strncpy(local.archive, pa[idx].archive, sizeof(local.archive) - 1);
+        xSemaphoreGive(mux);
+    }
+    if (!local.archive[0]) {
+        static char blob[1024];
+        if (esm.readArchiveInfo(blob, sizeof(blob))) {
+            strncpy(local.archive, blob, sizeof(local.archive) - 1);
+        }
+    }
+    local.sysMask     = readBlockSafe(0x0100, 16, local.sys);
+    local.ctrlMask    = readBlockSafe(0x100A, 22, local.ctrl);
+    local.cellVMask   = readBlockSafe(0x1200,  8, local.cellV);
+    local.packVMask   = readBlockSafe(0x1210,  8, local.packV);
+    local.tempLimMask = readBlockSafe(0x1220, 28, local.tempLim);
+    local.currLimMask = readBlockSafe(0x1270, 15, local.currLim);
+    local.funcSwMask  = readBlockSafe(0x12F0,  6, local.funcSw);
+    local.accCycMask  = readBlockSafe(0x7D6B,  2, local.accCyc);
+    local.done = true;
+    local.ts   = millis();
+
+    if (xSemaphoreTake(mux, pdMS_TO_TICKS(100)) == pdTRUE) {
+        pa[idx] = local;
+        p.audited = true;
+        xSemaphoreGive(mux);
+    }
+}
+
+static void pollPack(unsigned idx, bool deep) {
+    Pack &p = pk[idx];
     uint32_t now = millis();
     if (!p.authed && p.nextProbeMs && (int32_t)(now - p.nextProbeMs) < 0) {
         return; // offline pack in cooldown: keep polling healthy packs without delay
@@ -389,13 +467,21 @@ static void pollPack(Pack &p, bool deep) {
         }
         p.fails = 0;
         p.nextProbeMs = 0;
+        p.audited = false;
         deep = true;                     // populate cells/limits/faults immediately on link-up
         static char blob[1024];
         char sn[24] = "";
-        if (esm.readArchiveInfo(blob, sizeof(blob))) extractSerial(blob, sn, sizeof(sn));
-        if (sn[0] && xSemaphoreTake(mux, pdMS_TO_TICKS(100)) == pdTRUE) {
-            strncpy(p.serial, sn, sizeof(p.serial)); p.serial[sizeof(p.serial) - 1] = 0;
-            xSemaphoreGive(mux);                 // guards the cross-task serial read
+        size_t alen = esm.readArchiveInfo(blob, sizeof(blob));
+        if (alen) extractSerial(blob, sn, sizeof(sn));
+        if (xSemaphoreTake(mux, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (sn[0]) {
+                strncpy(p.serial, sn, sizeof(p.serial)); p.serial[sizeof(p.serial) - 1] = 0;
+            }
+            if (alen) {
+                strncpy(pa[idx].archive, blob, sizeof(pa[idx].archive) - 1);
+                pa[idx].archive[sizeof(pa[idx].archive) - 1] = 0;
+            }
+            xSemaphoreGive(mux);                 // guards the cross-task serial/archive read
         }
     }
     EsmMainData d;
@@ -417,6 +503,11 @@ static void pollPack(Pack &p, bool deep) {
     n.ts = millis();
 
     if (deep) {
+        if (!n.capAh) {
+            uint16_t cap = 0;
+            if (esm.readRegisters(0x0107, 1, &cap, 300) && cap >= 20 && cap <= 500) n.capAh = cap;
+            else n.capAh = 100; // ESM-48100B1 nominal capacity (100 Ah)
+        }
         uint16_t mv[15]; int16_t t[16];
         if (esm.readCells(mv, t)) {
             n.nCells = 0;
@@ -457,6 +548,7 @@ static void aggregate() {
     uint32_t now = millis();
     int n = 0, nWithLimits = 0;
     bool allFull = true;
+    uint8_t minPackSoc = 100;
     float sumV = 0, sumBusV = 0, sumI = 0;
     uint32_t weightedSocNum = 0, weightedSocDen = 0;
     uint32_t sumSoh = 0, sumCyc = 0;
@@ -469,7 +561,7 @@ static void aggregate() {
     uint8_t  maxTempPack = 1, maxTempIdx = 1, minTempPack = 1, minTempIdx = 1;
     int32_t  sumCellT = 0;
     uint32_t cntCellT = 0;
-    uint32_t sumCcl = 0, sumDcl = 0;
+    uint32_t sumCcl = 0, sumDcl = 0, sumCapAh = 0;
     uint16_t cvl = 0, dvl = 0;
     uint16_t orSysF = 0, orCellF = 0, orProt = 0, orWarn = 0, orSpec = 0;
 
@@ -477,7 +569,9 @@ static void aggregate() {
         Pack &p = pk[i];
         if (!p.s.valid || now - p.s.ts > STALE_MS) continue;
         n++;
+        sumCapAh += (p.s.capAh ? p.s.capAh : 100);
         if (p.s.soc < 100) allFull = false;
+        if (p.s.soc < minPackSoc) minPackSoc = p.s.soc;
         sumV += p.s.packV;
         sumBusV += p.s.busV;
         sumI += p.s.current;
@@ -524,37 +618,16 @@ static void aggregate() {
 
         if (p.s.haveLimits) {
             nWithLimits++;
-            uint32_t cclE = p.s.ccl_raw;
-            uint32_t dclE = p.s.dcl_raw;
-            uint16_t cclC = p.s.ccl_coef > 100 ? 100 : p.s.ccl_coef;
-            uint16_t dclC = p.s.dcl_coef > 100 ? 100 : p.s.dcl_coef;
-            if (cclC > 0) cclE = cclE * cclC / 100;
-            if (dclC > 0) dclE = dclE * dclC / 100;
-
-            // Per-pack LiFePO4 temperature & cell-voltage safety envelope
-            bool pFault = (p.s.sysFault | p.s.cellFault | p.s.prot) != 0;
-            if (pFault || p.s.tmax >= 55 || p.s.tmin <= 0 || (pMaxC >= 3620)) {
-                cclE = 0;
-            } else {
-                if (p.s.tmin <= 5 && cclE > 100)       cclE = 100; // <=5C: 10A/pack
-                else if (p.s.tmin <= 12 && cclE > 300) cclE = 300; // <=12C: 30A/pack
-                if (pMaxC >= 3550 && cclE > 50)        cclE = 50;  // >=3.55V: 5A/pack balance taper
-                else if (pMaxC >= 3500 && cclE > 150)  cclE = 150; // >=3.50V: 15A/pack taper
-                // If this pack already reached 100% SOC and tapered out (charge FET open),
-                // do not count its full bulk rating so remaining <100% packs aren't overloaded.
-                if (p.s.soc >= 100 && p.s.current <= 1.0f && cclE > 50) cclE = 50;
-            }
-            if ((p.s.sysFault | p.s.cellFault) != 0 || p.s.tmax >= 58 || (p.s.nCells && pMinC <= 2800)) {
-                dclE = 0;
-            }
+            uint16_t cclE = 0, dclE = 0;
+            PylontechEmu::effectiveLimits(p.s, cclE, dclE);
             sumCcl += cclE;
             sumDcl += dclE;
         }
         if (p.s.cvl_raw && (!cvl || p.s.cvl_raw < cvl)) cvl = p.s.cvl_raw;
         if (p.s.dvl_raw && (!dvl || p.s.dvl_raw > dvl)) dvl = p.s.dvl_raw;
     }
-    if (!cvl) cvl = 540;      // fallback 54.0 V
-    if (!dvl) dvl = 475;      // fallback 47.5 V
+    if (!cvl) cvl = 540;      // fallback 54.0 V (3.60 V/cell = 0x1200)
+    if (!dvl) dvl = 460;      // fallback 46.0 V (Huawei manual default LVD)
 
     PackSnapshot a;
     a.valid = (n > 0);
@@ -569,10 +642,15 @@ static void aggregate() {
         }
 
         // Clean full-charge hysteresis latch:
-        // Latch fullStop when every active pack is 100% SOC, current has tapered near 0, and cells >= 3.38V
-        if (allFull && fabsf(sumI) <= 0.4f && (bankMinCell == 0xFFFF || bankMinCell >= 3380)) {
+        //   * Engage when every active pack is 100% SOC, current has settled near 0, and
+        //     cells >= 3310 mV (includes rested 100% OCV so reboots never trigger a pulse).
+        //   * Release ONLY on real discharge (sumI < -1.0 A), meaningful SOC drop
+        //     (avgSoc <= 96% or any pack <= 94%), or safety cell floor (< 3280 mV) —
+        //     never on normal LiFePO4 surface-charge relaxation (3.31..3.35 V/cell).
+        if (allFull && fabsf(sumI) <= 0.5f && (bankMinCell == 0xFFFF || bankMinCell >= 3310)) {
             bankFullLatched = true;
-        } else if (!allFull || avgSoc <= 98 || sumI < -0.8f || (bankMinCell != 0xFFFF && bankMinCell < 3350)) {
+        } else if (avgSoc <= 96 || minPackSoc <= 94 || sumI < -1.0f ||
+                   (bankMinCell != 0xFFFF && bankMinCell < 3280)) {
             bankFullLatched = false;
         }
         if (bankFullLatched) sumCcl = 0;
@@ -580,6 +658,7 @@ static void aggregate() {
         a.haveLimits = (nWithLimits > 0);
         a.fullStop = bankFullLatched;
         a.nPacks = (uint8_t)n;
+        a.capAh = (uint16_t)((sumCapAh + (uint32_t)n / 2) / (uint32_t)n);
         a.packV = sumV / n;
         a.busV = sumBusV / n;
         a.current = sumI;
@@ -608,11 +687,12 @@ static void aggregate() {
         a.cvl_raw = cvl; a.dvl_raw = dvl;
         a.ccl_raw = sumCcl > 65535 ? 65535 : sumCcl;
         a.dcl_raw = sumDcl > 65535 ? 65535 : sumDcl;
-        a.ccl_coef = 100; a.dcl_coef = 100;
-        // Synchronize aggregate CCL/DCL with the exact Pylontech 0x63 effective limits
-        PylontechEmu::effectiveLimits(a, a.ccl_raw, a.dcl_raw);
+        a.ccl_coef = 0; a.dcl_coef = 0;
         a.sysFault = orSysF; a.cellFault = orCellF;
         a.prot = orProt; a.warn = orWarn; a.special = orSpec;
+        // Synchronize aggregate CCL/DCL with the exact Pylontech 0x63 effective limits
+        // (note: populate fault/prot/special BEFORE effectiveLimits so bank-level protections apply!)
+        PylontechEmu::effectiveLimits(a, a.ccl_raw, a.dcl_raw);
         a.ts = now;
     }
     agg = a;
@@ -624,11 +704,22 @@ static void esmTask(void *) {
     delay(200);
     uint32_t deepCtr = 0;
     for (;;) {
+        if (g_auditRefresh) {
+            g_auditRefresh = false;
+            for (unsigned i = 0; i < NUM_PACKS; i++) pk[i].audited = false;
+        }
         for (unsigned i = 0; i < NUM_PACKS; i++) {
             bool deep = !pk[i].s.haveLimits || !pk[i].s.valid || ((deepCtr++ % (NUM_PACKS * 3)) < NUM_PACKS);
-            pollPack(pk[i], deep);
+            pollPack(i, deep);
         }
         if (xSemaphoreTake(mux, pdMS_TO_TICKS(50)) == pdTRUE) { aggregate(); xSemaphoreGive(mux); }
+        // Audit at most 1 pack per outer loop so real-time BMS telemetry never pauses
+        for (unsigned i = 0; i < NUM_PACKS; i++) {
+            if (pk[i].authed && !pk[i].audited) {
+                auditPack(i);
+                break;
+            }
+        }
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
@@ -657,6 +748,16 @@ static void mqttReconnect() {
     bool ok = cfg.user[0] ? mqtt.connect(id.c_str(), cfg.user, cfg.pass)
                           : mqtt.connect(id.c_str());
     (void)ok;
+}
+
+static void packEffectiveDa(const PackSnapshot &ps, bool bankFullStop,
+                            uint16_t &cclDa, uint16_t &dclDa,
+                            uint16_t &nomCclDa, uint16_t &nomDclDa) {
+    uint16_t capDa = (uint16_t)((ps.capAh ? ps.capAh : 100) * 10); // 1.0C in 0.1 A (1000 = 100.0 A)
+    nomCclDa = ps.haveLimits ? min<uint16_t>(ps.ccl_raw, capDa) : 0;
+    nomDclDa = ps.haveLimits ? min<uint16_t>(ps.dcl_raw, capDa) : 0;
+    PylontechEmu::effectiveLimits(ps, cclDa, dclDa);
+    if (bankFullStop) cclDa = 0;
 }
 
 static void mqttPublish() {
@@ -706,16 +807,18 @@ static void mqttPublish() {
             for (uint8_t c = 0; c < p.s.nTemps && tn < sizeof(tempsJson) - 8; c++)
                 tn += snprintf(tempsJson + tn, sizeof(tempsJson) - tn, "%s%d", c ? "," : "", p.s.ctemps[c]);
             tempsJson[tn++] = ']'; tempsJson[tn] = 0;
+            uint16_t pCclDa = 0, pDclDa = 0, pNomC = 0, pNomD = 0;
+            packEffectiveDa(p.s, a.fullStop, pCclDa, pDclDa, pNomC, pNomD);
             snprintf(buf, sizeof(buf),
                      "{\"addr\":%d,\"sn\":\"%s\",\"soc\":%d,\"v\":%.2f,\"busv\":%.2f,\"i\":%.2f,\"soh\":%d,"
                      "\"tmin\":%d,\"tmax\":%d,\"cellmax\":%d,\"cellmin\":%d,\"spread\":%d,\"cycles\":%u,\"ah\":%u,"
-                     "\"ccl\":%.1f,\"dcl\":%.1f,\"cvl\":%.1f,\"dvl\":%.1f,\"cclcoef\":%d,\"dclcoef\":%d,"
+                     "\"ccl\":%.1f,\"dcl\":%.1f,\"cvl\":%.1f,\"dvl\":%.1f,\"cap_ah\":%u,"
                      "\"sysf\":%u,\"cellf\":%u,\"prot\":%u,\"warn\":%u,\"spec\":%u,"
                      "\"ncells\":%d,\"ntemps\":%d,\"cells\":%s,\"temps\":%s,\"ts\":%u}",
                      p.addr, p.serial, p.s.soc, p.s.packV, p.s.busV, p.s.current, p.s.soh,
                      p.s.tmin, p.s.tmax, hi, (lo == 0xFFFF ? 0 : lo), spread, p.s.cycles, p.s.ahTotal,
-                     p.s.ccl_raw / 10.0, p.s.dcl_raw / 10.0, p.s.cvl_raw / 10.0, p.s.dvl_raw / 10.0,
-                     p.s.ccl_coef, p.s.dcl_coef,
+                     pCclDa / 10.0, pDclDa / 10.0, p.s.cvl_raw / 10.0, p.s.dvl_raw / 10.0,
+                     (unsigned)(p.s.capAh ? p.s.capAh : 100),
                      p.s.sysFault, p.s.cellFault, p.s.prot, p.s.warn, p.s.special,
                      p.s.nCells, p.s.nTemps, cellsJson, tempsJson, ts);
             snprintf(topic, sizeof(topic), "%s/pack/%d", cfg.topic, p.addr);
@@ -749,8 +852,10 @@ static String jsonEsc(const char *s) {
     String out;
     if (!s) return out;
     for (; *s; s++) {
-        if (*s == '"' || *s == '\\') out += '\\';
-        if ((uint8_t)*s >= 0x20) out += *s;
+        if (*s == '"' || *s == '\\') { out += '\\'; out += *s; }
+        else if (*s == '\n')         { out += "\\n"; }
+        else if (*s == '\r')         { /* skip CR */ }
+        else if ((uint8_t)*s >= 0x20) out += *s;
     }
     return out;
 }
@@ -859,28 +964,73 @@ static String htmlPage() {
         h += "<p style='color:#0a0;font-size:13px'>WiFi: " + htmlEsc(WiFi.SSID().c_str()) + " &nbsp; "
              + WiFi.localIP().toString() + " &nbsp; <span style='color:#666'>(saved in NVS)</span></p>";
     }
+    uint32_t now = millis();
+    uint32_t nomCcl = 0, nomDcl = 0;
+    for (unsigned i = 0; i < NUM_PACKS; i++) {
+        Pack &p = local[i];
+        if (p.s.valid && now - p.s.ts < STALE_MS && p.s.haveLimits) {
+            uint16_t pc, pd, nc, nd;
+            packEffectiveDa(p.s, a.fullStop, pc, pd, nc, nd);
+            nomCcl += nc;
+            nomDcl += nd;
+        }
+    }
+    h += F("<div id=live>");
     if (a.valid) {
         float tavgVal = !isnan(a.tavg) ? a.tavg : ((a.tmin + a.tmax) * 0.5f);
-        h += "<p class=b>" + String(a.soc) + "% &nbsp; " + String(a.packV, 1) + " V &nbsp; "
+        h += "<p class=b id=lv_main>" + String(a.soc) + "% &nbsp; " + String(a.packV, 1) + " V &nbsp; "
              + String(a.current, 1) + " A</p>";
-        h += "<p>SOH " + String(a.soh) + "% (min " + String(a.sohMin ? a.sohMin : a.soh) + "%) &nbsp; "
+        String cclTxt = String(a.ccl_raw / 10.0, 1) + " A";
+        if (a.fullStop && nomCcl > 0) {
+            cclTxt += " <span style='color:#666;font-size:12px'>(full stop &bull; max " + String(nomCcl / 10.0, 1) + " A)</span>";
+        } else if (nomCcl > a.ccl_raw) {
+            cclTxt += " <span style='color:#666;font-size:12px'>(tapered &bull; max " + String(nomCcl / 10.0, 1) + " A)</span>";
+        }
+        String dclTxt = String(a.dcl_raw / 10.0, 1) + " A";
+        if (nomDcl > a.dcl_raw) {
+            dclTxt += " <span style='color:#666;font-size:12px'>(tapered &bull; max " + String(nomDcl / 10.0, 1) + " A)</span>";
+        }
+        h += "<p id=lv_sub>SOH " + String(a.soh) + "% (min " + String(a.sohMin ? a.sohMin : a.soh) + "%) &nbsp; "
              + String(tavgVal, 1) + " C (" + String(a.tmin) + ".." + String(a.tmax)
-             + " C) &nbsp; CCL " + String(a.ccl_raw / 10.0, 1) + " A &nbsp; DCL "
-             + String(a.dcl_raw / 10.0, 1) + " A</p>";
-    } else h += "<p>reading packs...</p>";
-    h += F("<table><tr><th>Pack</th><th>Serial</th><th>SOC</th><th>V</th><th>A</th><th>SOH</th><th>Temp</th></tr>");
-    uint32_t now = millis();
+             + " C)<br>CCL " + cclTxt + " &nbsp; DCL " + dclTxt + "</p>";
+    } else h += "<p class=b id=lv_main>--</p><p id=lv_sub>reading packs...</p>";
+    h += F("<table><thead><tr><th>Pack</th><th>Serial</th><th>SOC</th><th>V</th><th>A</th><th>SOH</th><th>Temp</th><th>CCL / DCL</th></tr></thead><tbody id=lv_tb>");
     for (unsigned i = 0; i < NUM_PACKS; i++) {
         Pack &p = local[i];
         bool ok = p.s.valid && now - p.s.ts < STALE_MS;
         h += "<tr><td>" + String(p.addr) + "</td><td>" + String(p.serial) + "</td>";
-        if (ok) h += "<td>" + String(p.s.soc) + "%</td><td>" + String(p.s.packV, 2) + "</td><td>"
-                     + String(p.s.current, 2) + "</td><td>" + String(p.s.soh) + "%</td><td>"
-                     + String(p.s.tmin) + ".." + String(p.s.tmax) + "</td>";
-        else h += "<td colspan=5 style='color:#999'>--</td>";
+        if (ok) {
+            uint16_t pc = 0, pd = 0, nc = 0, nd = 0;
+            packEffectiveDa(p.s, a.fullStop, pc, pd, nc, nd);
+            h += "<td>" + String(p.s.soc) + "%</td><td>" + String(p.s.packV, 2) + "</td><td>"
+                 + String(p.s.current, 2) + "</td><td>" + String(p.s.soh) + "%</td><td>"
+                 + String(p.s.tmin) + ".." + String(p.s.tmax) + "</td><td>"
+                 + String(pc / 10.0f, 0) + " / " + String(pd / 10.0f, 0) + " A</td>";
+        } else h += "<td colspan=6 style='color:#999'>--</td>";
         h += "</tr>";
     }
-    h += F("</table>"
+    h += F("</tbody></table></div>"
+           "<script>"
+           "setInterval(async()=>{"
+           "try{const r=await fetch('/status',{cache:'no-store'});const j=await r.json();const a=j.agg;"
+           "if(!a||!a.valid)return;"
+           "let nomC=0,nomD=0,tb='';"
+           "for(const p of j.packs){"
+           "tb+='<tr><td>'+p.addr+'</td><td>'+p.sn+'</td>';"
+           "if(p.ok){nomC+=p.nom_ccl;nomD+=p.nom_dcl;"
+           "tb+='<td>'+p.soc+'%</td><td>'+p.v.toFixed(2)+'</td><td>'+p.i.toFixed(2)+'</td><td>'+p.soh+'%</td><td>'+p.tmin+'..'+p.tmax+'</td><td>'+p.ccl.toFixed(0)+' / '+p.dcl.toFixed(0)+' A</td>';}"
+           "else tb+=\"<td colspan=6 style='color:#999'>--</td>\";"
+           "tb+='</tr>';}"
+           "document.getElementById('lv_tb').innerHTML=tb;"
+           "const m=document.getElementById('lv_main');if(m)m.innerHTML=a.soc+'% &nbsp; '+a.v.toFixed(1)+' V &nbsp; '+a.i.toFixed(1)+' A';"
+           "let ct=a.ccl.toFixed(1)+' A';"
+           "if(j.deye&&j.deye.fullStop&&nomC>0)ct+=\" <span style='color:#666;font-size:12px'>(full stop &bull; max \"+nomC.toFixed(1)+\" A)</span>\";"
+           "else if(nomC>a.ccl+0.2)ct+=\" <span style='color:#666;font-size:12px'>(tapered &bull; max \"+nomC.toFixed(1)+\" A)</span>\";"
+           "let dt=a.dcl.toFixed(1)+' A';"
+           "if(nomD>a.dcl+0.2)dt+=\" <span style='color:#666;font-size:12px'>(tapered &bull; max \"+nomD.toFixed(1)+\" A)</span>\";"
+           "const s=document.getElementById('lv_sub');if(s)s.innerHTML='SOH '+a.soh+'% (min '+a.soh_min+'%) &nbsp; '+a.tavg.toFixed(1)+' C ('+a.tmin+'..'+a.tmax+' C)<br>CCL '+ct+' &nbsp; DCL '+dt;"
+           "}catch(e){}},3000);"
+           "</script>"
            "<form method=POST action=/save>"
            "<fieldset><legend>WiFi (NVS Persistent)</legend>"
            "<span class=lbl>SSID</span><input name=wssid value='%WSSID%' size=28 maxlength=32><br>"
@@ -1039,15 +1189,20 @@ static void handleStatus() {
         for (uint8_t c = 0; c < p.s.nCells; c++) { if (p.s.cells[c] > hi) hi = p.s.cells[c]; if (p.s.cells[c] < lo) lo = p.s.cells[c]; }
         String cells = "["; for (uint8_t c = 0; c < p.s.nCells; c++) { if (c) cells += ","; cells += String(p.s.cells[c]); } cells += "]";
         String temps = "["; for (uint8_t c = 0; c < p.s.nTemps; c++) { if (c) temps += ","; temps += String(p.s.ctemps[c]); } temps += "]";
+        uint16_t pCclDa = 0, pDclDa = 0, pNomC = 0, pNomD = 0;
+        packEffectiveDa(p.s, a.fullStop, pCclDa, pDclDa, pNomC, pNomD);
         if (i) j += ",";
         j += "{\"addr\":" + String(p.addr) + ",\"sn\":\"" + String(p.serial) +
              "\",\"ok\":" + String(ok ? 1 : 0) + ",\"age\":" + String(p.s.valid ? (int32_t)(now - p.s.ts) : -1) +
+             ",\"cap_ah\":" + String(p.s.capAh ? p.s.capAh : 100) +
              ",\"soc\":" + String(p.s.soc) + ",\"v\":" + String(p.s.packV, 2) +
              ",\"busv\":" + String(p.s.busV, 2) +
              ",\"i\":" + String(p.s.current, 2) + ",\"soh\":" + String(p.s.soh) +
              ",\"tmin\":" + String(p.s.tmin) + ",\"tmax\":" + String(p.s.tmax) +
              ",\"cellmax\":" + String(hi) + ",\"cellmin\":" + String(lo == 0xFFFF ? 0 : lo) +
              ",\"cyc\":" + String(p.s.cycles) + ",\"ah\":" + String(p.s.ahTotal) +
+             ",\"ccl\":" + String(pCclDa / 10.0, 1) + ",\"dcl\":" + String(pDclDa / 10.0, 1) +
+             ",\"nom_ccl\":" + String(pNomC / 10.0, 1) + ",\"nom_dcl\":" + String(pNomD / 10.0, 1) +
              ",\"ccl_raw\":" + String(p.s.ccl_raw) + ",\"ccl_coef\":" + String(p.s.ccl_coef) +
              ",\"dcl_raw\":" + String(p.s.dcl_raw) + ",\"dcl_coef\":" + String(p.s.dcl_coef) +
              ",\"cvl_raw\":" + String(p.s.cvl_raw) + ",\"dvl_raw\":" + String(p.s.dvl_raw) +
@@ -1055,6 +1210,62 @@ static void handleStatus() {
              ",\"prot\":" + String(p.s.prot) + ",\"warn\":" + String(p.s.warn) + ",\"spec\":" + String(p.s.special) +
              ",\"ncells\":" + String(p.s.nCells) + ",\"ntemps\":" + String(p.s.nTemps) +
              ",\"cells\":" + cells + ",\"temps\":" + temps + "}";
+    }
+    j += "]}";
+    web.send(200, "application/json", j);
+}
+
+static void appendRegMapJson(String &j, const char *key, uint16_t startReg,
+                             const uint16_t *vals, uint32_t mask, uint8_t count) {
+    char hexKey[12];
+    j += ",\""; j += key; j += "\":{";
+    for (uint8_t i = 0; i < count; i++) {
+        if (i) j += ",";
+        snprintf(hexKey, sizeof(hexKey), "\"0x%04X\":", (unsigned)(startReg + i));
+        j += hexKey;
+        if (mask & (1u << i)) j += String(vals[i]);
+        else                  j += "null";
+    }
+    j += "}";
+}
+
+// Read-only full register & nameplate audit across all packs: GET /audit (or /audit?refresh=1)
+static void handleAudit() {
+    if (web.hasArg("refresh")) {
+        g_auditRefresh = true;
+    }
+    uint32_t now = millis();
+    String j;
+    j.reserve(10240);
+    j += "{\"fw\":\"" FW_VERSION "\",\"refreshQueued\":" + String(web.hasArg("refresh") ? 1 : 0) + ",\"packs\":[";
+    for (unsigned i = 0; i < NUM_PACKS; i++) {
+        static PackAudit a;   // loopTask is single-threaded: static avoids stack pressure
+        uint8_t addr = PACK_ADDR[i];
+        char sn[24] = "";
+        bool authed = false;
+        if (xSemaphoreTake(mux, pdMS_TO_TICKS(100)) == pdTRUE) {
+            a = pa[i];
+            addr = pk[i].addr;
+            authed = pk[i].authed;
+            strncpy(sn, pk[i].serial, sizeof(sn) - 1);
+            xSemaphoreGive(mux);
+        }
+        if (i) j += ",";
+        j += "{\"addr\":" + String(addr) +
+             ",\"sn\":\"" + jsonEsc(sn) + "\"" +
+             ",\"authed\":" + String(authed ? 1 : 0) +
+             ",\"audited\":" + String(a.done ? 1 : 0) +
+             ",\"ageMs\":" + String(a.done ? (int32_t)(now - a.ts) : -1) +
+             ",\"archive\":\"" + jsonEsc(a.archive) + "\"";
+        appendRegMapJson(j, "sys_0100",     0x0100, a.sys,     a.sysMask,     16);
+        appendRegMapJson(j, "ctrl_100A",    0x100A, a.ctrl,    a.ctrlMask,    22);
+        appendRegMapJson(j, "cellV_1200",   0x1200, a.cellV,   a.cellVMask,    8);
+        appendRegMapJson(j, "packV_1210",   0x1210, a.packV,   a.packVMask,    8);
+        appendRegMapJson(j, "tempLim_1220", 0x1220, a.tempLim, a.tempLimMask, 28);
+        appendRegMapJson(j, "currLim_1270", 0x1270, a.currLim, a.currLimMask, 15);
+        appendRegMapJson(j, "funcSw_12F0",  0x12F0, a.funcSw,  a.funcSwMask,   6);
+        appendRegMapJson(j, "accCyc_7D6B",  0x7D6B, a.accCyc,  a.accCycMask,   2);
+        j += "}";
     }
     j += "]}";
     web.send(200, "application/json", j);
@@ -1126,9 +1337,13 @@ void setup() {
     });
     ArduinoOTA.begin();
 
-    web.on("/", []() { web.send(200, "text/html; charset=utf-8", htmlPage()); });
+    web.on("/", []() {
+        web.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+        web.send(200, "text/html; charset=utf-8", htmlPage());
+    });
     web.on("/save", HTTP_POST, handleSave);
     web.on("/status", handleStatus);
+    web.on("/audit", HTTP_GET, handleAudit);
     // captive portal: send any other URL to the config page (setup-AP use)
     web.onNotFound([]() { web.sendHeader("Location", "/"); web.send(302, "text/plain", ""); });
     web.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);

@@ -59,7 +59,9 @@ public:
 
     bool readMainData(EsmMainData &out);
     bool readStatusBits(EsmStatusBits &out);
-    bool readRegisters(uint16_t startReg, uint16_t count, uint16_t *out);
+    bool readRegisters(uint16_t startReg, uint16_t count, uint16_t *out, uint32_t timeoutMs = 1000);
+    bool writeRegister(uint16_t reg, uint16_t val, uint8_t *excOut = nullptr, uint32_t timeoutMs = 1000);
+    bool writeRegisters(uint16_t startReg, uint16_t count, const uint16_t *vals, uint8_t *excOut = nullptr, uint32_t timeoutMs = 1000);
 
     // Confirmed on the ESM-4875A1: 15 cell voltages (mV) at 0x0022,
     // 16 temperature sensors at 0x0012, and 32-bit cycles and Ah at
