@@ -122,6 +122,12 @@ void displayBank(const BankView &v) {
     spr.setTextDatum(TL_DATUM);
     spr.setTextColor(TFT_CYAN, TFT_BLACK);
     spr.drawString("ESM bank", 6, 2, 2);
+    if (v.chgTag && v.chgTag[0]) {
+        uint16_t tagCol = !strcmp(v.chgTag, "STOP") ? TFT_GREEN
+                        : (!strcmp(v.chgTag, "FLT") ? TFT_YELLOW : TFT_ORANGE);
+        spr.setTextColor(tagCol, TFT_BLACK);
+        spr.drawString(v.chgTag, 82, 2, 2);
+    }
     // WiFi IP and MQTT dot, on the right side
     spr.setTextColor(v.mqttOn ? (v.mqttOk ? TFT_GREEN : TFT_RED) : TFT_DARKGREY, TFT_BLACK);
     spr.setTextDatum(TR_DATUM);

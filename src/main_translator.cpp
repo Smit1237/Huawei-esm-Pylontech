@@ -191,8 +191,14 @@ static void esmTask(void *) {
                         if (t[i] >= -50 && t[i] <= 125) local.ctemps[local.nTemps++] = t[i];
                 }
                 uint32_t cyc, ah;
-                if (esm.readStats(cyc, ah))
-                    local.cycles = cyc > 65535 ? 65535 : (uint16_t)cyc;
+                if (esm.readStats(cyc, ah)) {
+                    local.rawCycles = cyc > 65535 ? 65535 : (uint16_t)cyc;
+                    local.ahTotal   = ah;
+                    uint32_t cap    = local.capAh ? local.capAh : 100;
+                    uint32_t efc    = (ah + cap / 2) / cap;
+                    local.efcCycles = efc > 65535 ? 65535 : (uint16_t)efc;
+                    local.cycles    = local.efcCycles;
+                }
 
                 // limit registers 0x100A..0x1018
                 uint16_t lim[15];

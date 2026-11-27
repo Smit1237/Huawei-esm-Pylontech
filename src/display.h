@@ -42,8 +42,9 @@ struct BankView {
     // Per-pack SOC for the row. Index 0 to nPacks-1. A value of -1 shows absent.
     int      packSoc[6];
     int      packAddr[6];
-    // Link status.
+    // Link & charge state status.
     const char *ip;           // WiFi IP address, or the text "WiFi...".
+    const char *chgTag;       // Short charge state tag: "STOP", "FLT", or "BULK".
     bool     mqttOn, mqttOk;
     uint32_t deyeAgeMs;       // Time in ms since the last Deye poll. UINT32_MAX shows no poll yet.
 };

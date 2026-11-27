@@ -25,6 +25,7 @@
 #include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
+#include <esp_timer.h>
 #include <time.h>
 #include "huawei_esm.h"
 #include "pylontech.h"
@@ -61,7 +62,7 @@
 // Increase this on each build. Then you can confirm the live image in the
 // WebUI header and the serial banner. This proves that an OTA push worked.
 #ifndef FW_VERSION
-#define FW_VERSION "bank-2.4-exp"
+#define FW_VERSION "bank-2.5-exp"
 #endif
 #ifndef ESM_TX_PIN
 #define ESM_TX_PIN 33
@@ -127,6 +128,11 @@ static SemaphoreHandle_t mux;            // guards pk[] and agg
 static TaskHandle_t esmH = nullptr, deyeH = nullptr;  // suspended during a web OTA
 
 // ---------------- config (saved) ----------------
+enum ChargeMode : uint8_t {
+    CHG_MODE_UPS_STOP    = 0,  // EOC Stop: CCL = 0 A when full until Rebulk SOC / timer
+    CHG_MODE_SOLAR_FLOAT = 1,  // Follow-Float CVL: step CVL down to Float V, keep gentle CCL open
+};
+
 struct Config {
     bool     mqttEnable = false;
     char     host[64] = "";
@@ -141,6 +147,13 @@ struct Config {
     char     ntp2[48] = "";
     char     ntp3[48] = "";
     char     tz[40]   = "Europe/Moscow"; // IANA name or raw POSIX (the offset sign is INVERTED)
+    // Charge & BMS reporting policy (persisted in NVS "bank")
+    uint8_t  chgMode      = CHG_MODE_UPS_STOP;
+    uint8_t  rebulkSoc    = 96;          // % bank SOC threshold to start a new Bulk cycle (70..99)
+    uint8_t  rebulkDays   = 14;          // periodic top-balance interval in days (0 = disabled, 1..60)
+    uint16_t floatVoltDv  = 501;         // target Float CVL in 0.1 V (501 = 50.1 V = 3.340 V/cell)
+    bool     ahCycles     = true;        // true = report Ah-equivalent cycles (ah/cap) to Deye 0x61
+    uint32_t lastEocEpoch = 0;           // UTC epoch of last completed full charge
     // WiFi credentials persisted in NVS ("wifi" + "bank" + esp_wifi net80211),
     // surviving OTA updates and normal USB reflashes.
     char     wifiSsid[33] = "";
@@ -149,6 +162,17 @@ struct Config {
 static Config cfg;
 static Preferences prefs;
 static bool wifiNvsExplicit = false;     // true once "wifi" NVS namespace is initialized
+static volatile bool pendingSaveEocTs = false;
+
+struct ChargeCtrlState {
+    bool     eocLatched     = false;     // true = EOC reached, waiting for Rebulk (Stop or Float)
+    bool     forceBulk      = false;     // manual Force Rebulk requested via WebUI
+    uint16_t activeFloatDv  = 501;       // current stepped Follow-Float CVL in 0.1 V
+    uint64_t lastEocMonoS   = 0;         // monotonic seconds at last EOC
+    uint64_t bulkHoldUntilS = 0;         // min Bulk hold window when manual/timer rebulk fires at 100%
+    uint64_t lastFloatStepS = 0;         // monotonic seconds of last Follow-Float 60s decrement
+};
+static ChargeCtrlState chgSt;
 
 static void initNvs() {
     esp_err_t err = nvs_flash_init();
@@ -195,10 +219,23 @@ static void loadCfg() {
         prefs.getString("ntp2", cfg.ntp2, sizeof(cfg.ntp2));
         prefs.getString("ntp3", cfg.ntp3, sizeof(cfg.ntp3));
         { String z = prefs.getString("tz", "Europe/Moscow"); z.toCharArray(cfg.tz, sizeof(cfg.tz)); }
+        cfg.chgMode      = prefs.getUChar("cmode", CHG_MODE_UPS_STOP);
+        cfg.rebulkSoc    = prefs.getUChar("rbsoc", 96);
+        cfg.rebulkDays   = prefs.getUChar("rbdays", 14);
+        cfg.floatVoltDv  = prefs.getUShort("fltdv", 501);
+        cfg.ahCycles     = prefs.getBool("ahcyc", true);
+        cfg.lastEocEpoch = prefs.getULong("eocts", 0);
         prefs.getString("wssid", cfg.wifiSsid, sizeof(cfg.wifiSsid));
         prefs.getString("wpass", cfg.wifiPass, sizeof(cfg.wifiPass));
         prefs.end();
     }
+    if (cfg.chgMode > CHG_MODE_SOLAR_FLOAT) cfg.chgMode = CHG_MODE_UPS_STOP;
+    if (cfg.rebulkSoc < 70)  cfg.rebulkSoc = 70;
+    if (cfg.rebulkSoc > 99)  cfg.rebulkSoc = 99;
+    if (cfg.rebulkDays > 60) cfg.rebulkDays = 60;
+    if (cfg.floatVoltDv < 490) cfg.floatVoltDv = 490;
+    if (cfg.floatVoltDv > 535) cfg.floatVoltDv = 535;
+    chgSt.activeFloatDv = cfg.floatVoltDv;
 
     // Dedicated "wifi" NVS namespace takes precedence over legacy "bank" keys.
     char wSsid[33] = "", wPass[65] = "";
@@ -235,6 +272,12 @@ static void saveCfg() {
         prefs.putString("ntp2", cfg.ntp2);
         prefs.putString("ntp3", cfg.ntp3);
         prefs.putString("tz", cfg.tz);
+        prefs.putUChar("cmode", cfg.chgMode);
+        prefs.putUChar("rbsoc", cfg.rebulkSoc);
+        prefs.putUChar("rbdays", cfg.rebulkDays);
+        prefs.putUShort("fltdv", cfg.floatVoltDv);
+        prefs.putBool("ahcyc", cfg.ahCycles);
+        prefs.putULong("eocts", cfg.lastEocEpoch);
         prefs.putString("wssid", cfg.wifiSsid);
         prefs.putString("wpass", cfg.wifiPass);
         prefs.end();
@@ -518,7 +561,14 @@ static void pollPack(unsigned idx, bool deep) {
                 if (t[i] >= -50 && t[i] <= 125) n.ctemps[n.nTemps++] = t[i];
         }
         uint32_t cyc, ah;
-        if (esm.readStats(cyc, ah)) { n.cycles = cyc > 65535 ? 65535 : (uint16_t)cyc; n.ahTotal = ah; }
+        if (esm.readStats(cyc, ah)) {
+            n.rawCycles = cyc > 65535 ? 65535 : (uint16_t)cyc;
+            n.ahTotal   = ah;
+            uint32_t cap = n.capAh ? n.capAh : 100;
+            uint32_t efc = (ah + cap / 2) / cap;
+            n.efcCycles = efc > 65535 ? 65535 : (uint16_t)efc;
+            n.cycles    = n.rawCycles;
+        }
         uint16_t lim[15];
         if (esm.readRegisters(0x100A, 15, lim)) {
             n.cvl_raw = lim[0]; n.dcl_raw = lim[1]; n.ccl_raw = lim[3];
@@ -544,16 +594,16 @@ static void pollPack(unsigned idx, bool deep) {
 //     position) for OV/UV protection, while tracking within-pack spread for cell imbalance.
 //   * Compute true arithmetic mean across all valid NTC sensors (all 60 thermistors).
 static void aggregate() {
-    static bool bankFullLatched = false;
     uint32_t now = millis();
+    uint64_t monoS = (uint64_t)(esp_timer_get_time() / 1000000ULL);
     int n = 0, nWithLimits = 0;
     bool allFull = true;
     uint8_t minPackSoc = 100;
     float sumV = 0, sumBusV = 0, sumI = 0;
     uint32_t weightedSocNum = 0, weightedSocDen = 0;
-    uint32_t sumSoh = 0, sumCyc = 0;
+    uint32_t sumSoh = 0, sumRawCyc = 0, sumEfcCyc = 0;
     int minSoh = 100;
-    uint16_t maxCyc = 0;
+    uint16_t maxRawCyc = 0, maxEfcCyc = 0;
     uint16_t bankMaxCell = 0, bankMinCell = 0xFFFF, bankMaxSpread = 0;
     uint8_t  maxCellPack = 1, maxCellIdx = 1, minCellPack = 1, minCellIdx = 1;
     int16_t  bankMaxT = -128, bankMinT = 127;
@@ -583,8 +633,13 @@ static void aggregate() {
         sumSoh += p.s.soh;
         if (p.s.soh < minSoh) minSoh = p.s.soh;
 
-        sumCyc += p.s.cycles;
-        if (maxCyc < p.s.cycles) maxCyc = p.s.cycles;
+        uint16_t pRaw = p.s.rawCycles ? p.s.rawCycles : p.s.cycles;
+        uint32_t pCap = p.s.capAh ? p.s.capAh : 100;
+        uint16_t pEfc = p.s.efcCycles ? p.s.efcCycles : (uint16_t)((p.s.ahTotal + pCap / 2) / pCap);
+        sumRawCyc += pRaw;
+        if (maxRawCyc < pRaw) maxRawCyc = pRaw;
+        sumEfcCyc += pEfc;
+        if (maxEfcCyc < pEfc) maxEfcCyc = pEfc;
 
         bankMaxT = max<int16_t>(bankMaxT, p.s.tmax);
         bankMinT = min<int16_t>(bankMinT, p.s.tmin);
@@ -632,36 +687,101 @@ static void aggregate() {
     PackSnapshot a;
     a.valid = (n > 0);
     if (n > 0) {
-        uint8_t  avgSoc = weightedSocDen ? (uint8_t)((weightedSocNum + weightedSocDen / 2) / weightedSocDen) : 0;
-        uint8_t  avgSoh = (uint8_t)((sumSoh + (uint32_t)n / 2) / (uint32_t)n);
-        uint16_t avgCyc = (uint16_t)((sumCyc + (uint32_t)n / 2) / (uint32_t)n);
+        uint8_t  avgSoc    = weightedSocDen ? (uint8_t)((weightedSocNum + weightedSocDen / 2) / weightedSocDen) : 0;
+        uint8_t  avgSoh    = (uint8_t)((sumSoh + (uint32_t)n / 2) / (uint32_t)n);
+        uint16_t avgRawCyc = (uint16_t)((sumRawCyc + (uint32_t)n / 2) / (uint32_t)n);
+        uint16_t avgEfcCyc = (uint16_t)((sumEfcCyc + (uint32_t)n / 2) / (uint32_t)n);
+        float    avgPackV  = sumV / n;
 
         if (cntCellT > 0) {
             bankMaxT = max<int16_t>(bankMaxT, bankMaxSensorT);
             bankMinT = min<int16_t>(bankMinT, bankMinSensorT);
         }
 
-        // Clean full-charge hysteresis latch (96%..100% SOC window):
-        //   * Engage when every active pack is 100% SOC, current has settled near 0, and
-        //     cells >= 3310 mV (includes rested 100% OCV so reboots never trigger a pulse).
-        //   * Release ONLY on meaningful SOC drop (avgSoc <= 96% or any pack <= 94%) or
-        //     genuine low-cell safety floor (< 3260 mV at rest, or < 3150 mV under load).
-        //     Brief grid brownouts (< 3..4% DOD) keep CCL = 0 A (while DCL stays 400 A)
-        //     so short outages do not trigger post-outage top-ups or pile up cycle counts.
+        // Dual-mode post-EOC controller (selectable in WebUI, persisted in NVS):
+        //   * Mode 0 (UPS Stop):   CCL = 0 A when full; stays parked across brief brownouts
+        //                          until Rebulk SOC / periodic Rebulk Days / low-cell floor.
+        //   * Mode 1 (Follow-Float): YamBMS-style Follow-Float CVL step-down (0.1 V / 60s
+        //                          behind relaxing pack voltage so Deye never overvoltage-dumps)
+        //                          while keeping gentle CCL open until Rebulk triggers.
+        uint32_t ep = epochNow();
+        if (ep > 0 && cfg.lastEocEpoch == 0 && chgSt.eocLatched) {
+            cfg.lastEocEpoch = ep;
+            pendingSaveEocTs = true;
+        }
+
+        uint8_t packRebulkSoc = (cfg.rebulkSoc > 2) ? (cfg.rebulkSoc - 2) : 0;
         bool cellFloorTrip = (bankMinCell != 0xFFFF) &&
                              ((fabsf(sumI) <= 1.0f && bankMinCell < 3260) || bankMinCell < 3150);
-        if (allFull && fabsf(sumI) <= 0.5f && (bankMinCell == 0xFFFF || bankMinCell >= 3310)) {
-            bankFullLatched = true;
-        } else if (avgSoc <= 96 || minPackSoc <= 94 || cellFloorTrip) {
-            bankFullLatched = false;
+        bool daysDue = false;
+        if (cfg.rebulkDays > 0) {
+            if (ep > 0 && cfg.lastEocEpoch > 0 && ep > cfg.lastEocEpoch) {
+                daysDue = (ep - cfg.lastEocEpoch) >= (uint32_t)cfg.rebulkDays * 86400UL;
+            } else if (ep == 0 && chgSt.lastEocMonoS > 0) {
+                daysDue = (monoS - chgSt.lastEocMonoS) >= (uint64_t)cfg.rebulkDays * 86400ULL;
+            }
         }
-        if (bankFullLatched) sumCcl = 0;
+
+        if (chgSt.eocLatched) {
+            if (chgSt.forceBulk || avgSoc <= cfg.rebulkSoc || minPackSoc <= packRebulkSoc ||
+                cellFloorTrip || daysDue) {
+                bool holdAt100 = (chgSt.forceBulk || daysDue) && allFull;
+                chgSt.eocLatched     = false;
+                chgSt.forceBulk      = false;
+                chgSt.bulkHoldUntilS = holdAt100 ? (monoS + 300) : 0; // 5 min Bulk window if already 100%
+            }
+        } else {
+            if (chgSt.forceBulk) {
+                chgSt.forceBulk = false;
+                if (allFull && chgSt.bulkHoldUntilS < monoS + 300) chgSt.bulkHoldUntilS = monoS + 300;
+            }
+            if (monoS >= chgSt.bulkHoldUntilS && allFull && fabsf(sumI) <= 0.5f &&
+                (bankMinCell == 0xFFFF || bankMinCell >= 3310)) {
+                bool hadBulkSession  = (chgSt.bulkHoldUntilS > 0) || (chgSt.lastEocMonoS > 0);
+                chgSt.eocLatched     = true;
+                chgSt.bulkHoldUntilS = 0;
+                chgSt.lastEocMonoS   = monoS;
+                if (ep > 0 && (hadBulkSession || cfg.lastEocEpoch == 0)) {
+                    cfg.lastEocEpoch = ep;
+                    pendingSaveEocTs = true;
+                }
+                uint16_t liveDv = (uint16_t)ceilf(avgPackV * 10.0f);
+                chgSt.activeFloatDv  = max<uint16_t>(cfg.floatVoltDv, min<uint16_t>(cvl, liveDv));
+                chgSt.lastFloatStepS = monoS;
+            }
+        }
+
+        bool useStop  = false;
+        bool useFloat = false;
+        if (chgSt.eocLatched) {
+            uint16_t liveRoundDv = (uint16_t)lroundf(avgPackV * 10.0f);
+            if (cfg.chgMode == CHG_MODE_SOLAR_FLOAT) {
+                useFloat = true;
+                if (chgSt.activeFloatDv < cfg.floatVoltDv) chgSt.activeFloatDv = cfg.floatVoltDv;
+                if (chgSt.activeFloatDv > cvl)             chgSt.activeFloatDv = cvl;
+                if (monoS - chgSt.lastFloatStepS >= 60) {
+                    chgSt.lastFloatStepS = monoS;
+                    if (chgSt.activeFloatDv > cfg.floatVoltDv && liveRoundDv <= chgSt.activeFloatDv) {
+                        chgSt.activeFloatDv--;
+                    }
+                }
+                cvl = min<uint16_t>(cvl, chgSt.activeFloatDv);
+            } else {
+                useStop = true;
+                sumCcl  = 0;
+                // Keep activeFloatDv tracking live voltage so switching to Float is seamless
+                uint16_t ceilDv = (uint16_t)ceilf(avgPackV * 10.0f);
+                chgSt.activeFloatDv  = max<uint16_t>(cfg.floatVoltDv, min<uint16_t>(cvl, ceilDv));
+                chgSt.lastFloatStepS = monoS;
+            }
+        }
 
         a.haveLimits = (nWithLimits > 0);
-        a.fullStop = bankFullLatched;
+        a.fullStop = useStop;
+        a.floatMode = useFloat;
         a.nPacks = (uint8_t)n;
         a.capAh = (uint16_t)((sumCapAh + (uint32_t)n / 2) / (uint32_t)n);
-        a.packV = sumV / n;
+        a.packV = avgPackV;
         a.busV = sumBusV / n;
         a.current = sumI;
         a.soc = avgSoc;
@@ -673,8 +793,12 @@ static void aggregate() {
         a.nTemps = 0;
         a.maxTempPack = maxTempPack; a.maxTempIdx = maxTempIdx;
         a.minTempPack = minTempPack; a.minTempIdx = minTempIdx;
-        a.cycles = maxCyc;
-        a.cyclesAvg = avgCyc;
+        a.rawCycles = maxRawCyc;
+        a.rawCyclesAvg = avgRawCyc;
+        a.efcCycles = maxEfcCyc;
+        a.efcCyclesAvg = avgEfcCyc;
+        a.cycles = cfg.ahCycles ? maxEfcCyc : maxRawCyc;
+        a.cyclesAvg = cfg.ahCycles ? avgEfcCyc : avgRawCyc;
         if (bankMaxCell && bankMinCell != 0xFFFF) {
             a.cells[0] = bankMaxCell;
             a.cells[1] = bankMinCell;
@@ -752,19 +876,27 @@ static void mqttReconnect() {
     (void)ok;
 }
 
-static void packEffectiveDa(const PackSnapshot &ps, bool bankFullStop,
+static void packEffectiveDa(const PackSnapshot &ps, const PackSnapshot &bankAgg,
                             uint16_t &cclDa, uint16_t &dclDa,
                             uint16_t &nomCclDa, uint16_t &nomDclDa) {
     uint16_t capDa = (uint16_t)((ps.capAh ? ps.capAh : 100) * 10); // 1.0C in 0.1 A (1000 = 100.0 A)
     nomCclDa = ps.haveLimits ? min<uint16_t>(ps.ccl_raw, capDa) : 0;
     nomDclDa = ps.haveLimits ? min<uint16_t>(ps.dcl_raw, capDa) : 0;
-    PylontechEmu::effectiveLimits(ps, cclDa, dclDa);
-    if (bankFullStop) cclDa = 0;
+    PackSnapshot tmp = ps;
+    tmp.fullStop  = bankAgg.fullStop;
+    tmp.floatMode = bankAgg.floatMode;
+    PylontechEmu::effectiveLimits(tmp, cclDa, dclDa);
+}
+
+static const char *chargeStateName(const PackSnapshot &a) {
+    if (a.fullStop)  return "eoc_stop";
+    if (a.floatMode) return "float";
+    return "bulk";
 }
 
 static void mqttPublish() {
     if (!cfg.mqttEnable || !mqtt.connected()) return;
-    char topic[80], buf[768];            // per-pack payload with full cell and temp arrays and faults
+    char topic[80], buf[896];            // per-pack payload with full cell and temp arrays and faults
 
     PackSnapshot a; Pack local[NUM_PACKS];
     if (xSemaphoreTake(mux, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -785,11 +917,15 @@ static void mqttPublish() {
         snprintf(buf, sizeof(buf),
                  "{\"soc\":%d,\"v\":%.2f,\"busv\":%.2f,\"i\":%.2f,\"soh\":%d,\"soh_min\":%d,"
                  "\"tavg\":%.1f,\"tmin\":%d,\"tmax\":%d,\"cycles_avg\":%u,\"cycles\":%u,"
-                 "\"spread_max\":%u,\"ccl\":%.1f,\"dcl\":%.1f,\"packs\":%d,\"ts\":%u}",
+                 "\"efc_avg\":%u,\"efc_max\":%u,\"raw_cycles_avg\":%u,\"raw_cycles\":%u,"
+                 "\"spread_max\":%u,\"ccl\":%.1f,\"dcl\":%.1f,\"cvl\":%.1f,\"chg_state\":\"%s\","
+                 "\"packs\":%d,\"ts\":%u}",
                  a.soc, a.packV, a.busV, a.current, a.soh, a.sohMin ? a.sohMin : a.soh,
-                 tavgVal, a.tmin, a.tmax, a.cyclesAvg ? a.cyclesAvg : a.cycles, a.cycles,
+                 tavgVal, a.tmin, a.tmax, a.cyclesAvg, a.cycles,
+                 a.efcCyclesAvg, a.efcCycles, a.rawCyclesAvg, a.rawCycles,
                  a.maxSpread == 0xFFFF ? 0 : a.maxSpread,
-                 a.ccl_raw / 10.0, a.dcl_raw / 10.0, nfresh, ts);
+                 a.ccl_raw / 10.0, a.dcl_raw / 10.0, a.cvl_raw / 10.0, chargeStateName(a),
+                 nfresh, ts);
         snprintf(topic, sizeof(topic), "%s/bank", cfg.topic);
         mqtt.publish(topic, buf);
     }
@@ -810,17 +946,22 @@ static void mqttPublish() {
                 tn += snprintf(tempsJson + tn, sizeof(tempsJson) - tn, "%s%d", c ? "," : "", p.s.ctemps[c]);
             tempsJson[tn++] = ']'; tempsJson[tn] = 0;
             uint16_t pCclDa = 0, pDclDa = 0, pNomC = 0, pNomD = 0;
-            packEffectiveDa(p.s, a.fullStop, pCclDa, pDclDa, pNomC, pNomD);
+            packEffectiveDa(p.s, a, pCclDa, pDclDa, pNomC, pNomD);
+            uint32_t cap = p.s.capAh ? p.s.capAh : 100;
+            uint16_t efc = p.s.efcCycles ? p.s.efcCycles : (uint16_t)((p.s.ahTotal + cap / 2) / cap);
+            uint16_t raw = p.s.rawCycles ? p.s.rawCycles : p.s.cycles;
             snprintf(buf, sizeof(buf),
                      "{\"addr\":%d,\"sn\":\"%s\",\"soc\":%d,\"v\":%.2f,\"busv\":%.2f,\"i\":%.2f,\"soh\":%d,"
-                     "\"tmin\":%d,\"tmax\":%d,\"cellmax\":%d,\"cellmin\":%d,\"spread\":%d,\"cycles\":%u,\"ah\":%u,"
+                     "\"tmin\":%d,\"tmax\":%d,\"cellmax\":%d,\"cellmin\":%d,\"spread\":%d,"
+                     "\"cycles\":%u,\"efc\":%u,\"ah\":%u,"
                      "\"ccl\":%.1f,\"dcl\":%.1f,\"cvl\":%.1f,\"dvl\":%.1f,\"cap_ah\":%u,"
                      "\"sysf\":%u,\"cellf\":%u,\"prot\":%u,\"warn\":%u,\"spec\":%u,"
                      "\"ncells\":%d,\"ntemps\":%d,\"cells\":%s,\"temps\":%s,\"ts\":%u}",
                      p.addr, p.serial, p.s.soc, p.s.packV, p.s.busV, p.s.current, p.s.soh,
-                     p.s.tmin, p.s.tmax, hi, (lo == 0xFFFF ? 0 : lo), spread, p.s.cycles, p.s.ahTotal,
-                     pCclDa / 10.0, pDclDa / 10.0, p.s.cvl_raw / 10.0, p.s.dvl_raw / 10.0,
-                     (unsigned)(p.s.capAh ? p.s.capAh : 100),
+                     p.s.tmin, p.s.tmax, hi, (lo == 0xFFFF ? 0 : lo), spread,
+                     raw, efc, p.s.ahTotal,
+                     pCclDa / 10.0, pDclDa / 10.0, a.cvl_raw / 10.0, p.s.dvl_raw / 10.0,
+                     (unsigned)cap,
                      p.s.sysFault, p.s.cellFault, p.s.prot, p.s.warn, p.s.special,
                      p.s.nCells, p.s.nTemps, cellsJson, tempsJson, ts);
             snprintf(topic, sizeof(topic), "%s/pack/%d", cfg.topic, p.addr);
@@ -944,15 +1085,18 @@ static void startWifi() {
 }
 
 static String htmlPage() {
-    PackSnapshot a; Pack local[NUM_PACKS];
+    PackSnapshot a; Pack local[NUM_PACKS]; ChargeCtrlState cs;
     if (xSemaphoreTake(mux, pdMS_TO_TICKS(50)) == pdTRUE) {
-        a = agg; for (unsigned i = 0; i < NUM_PACKS; i++) local[i] = pk[i]; xSemaphoreGive(mux);
+        a = agg; cs = chgSt;
+        for (unsigned i = 0; i < NUM_PACKS; i++) local[i] = pk[i];
+        xSemaphoreGive(mux);
     }
     String h = F("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-                 "<style>body{font-family:system-ui;margin:16px;max-width:640px}"
-                 "table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:4px 6px;font-size:14px;text-align:right}"
-                 "th:first-child,td:first-child{text-align:left}input{padding:4px 6px;margin:3px 0}fieldset{margin:12px 0}"
-                 ".lbl{display:inline-block;min-width:74px}.b{font-size:22px;font-weight:bold}</style>"
+                 "<style>body{font-family:system-ui;margin:16px;max-width:700px}"
+                 "table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:4px 6px;font-size:13px;text-align:right}"
+                 "th:first-child,td:first-child{text-align:left}input,select{padding:4px 6px;margin:3px 0}fieldset{margin:12px 0}"
+                 ".lbl{display:inline-block;min-width:110px}.b{font-size:22px;font-weight:bold;margin:8px 0 4px}"
+                 ".pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;font-weight:600}</style>"
                  "<h2>ESM bank <span style='font-size:13px;color:#888;font-weight:normal'>fw " FW_VERSION "</span></h2>");
     if (apMode) {
         if (cfg.wifiSsid[0])
@@ -972,7 +1116,7 @@ static String htmlPage() {
         Pack &p = local[i];
         if (p.s.valid && now - p.s.ts < STALE_MS && p.s.haveLimits) {
             uint16_t pc, pd, nc, nd;
-            packEffectiveDa(p.s, a.fullStop, pc, pd, nc, nd);
+            packEffectiveDa(p.s, a, pc, pd, nc, nd);
             nomCcl += nc;
             nomDcl += nd;
         }
@@ -980,11 +1124,24 @@ static String htmlPage() {
     h += F("<div id=live>");
     if (a.valid) {
         float tavgVal = !isnan(a.tavg) ? a.tavg : ((a.tmin + a.tmax) * 0.5f);
-        h += "<p class=b id=lv_main>" + String(a.soc) + "% &nbsp; " + String(a.packV, 1) + " V &nbsp; "
-             + String(a.current, 1) + " A</p>";
+        String badge;
+        if (a.fullStop) {
+            badge = "<span class=pill style='background:#dff6e4;color:#0f6a28'>UPS EOC Stop &bull; Rebulk &le; "
+                    + String(cfg.rebulkSoc) + "%</span>";
+        } else if (a.floatMode) {
+            badge = "<span class=pill style='background:#e0f0ff;color:#0b5394'>Follow-Float &bull; CVL "
+                    + String(a.cvl_raw / 10.0, 1) + " V (target " + String(cfg.floatVoltDv / 10.0, 1) + " V)</span>";
+        } else {
+            badge = "<span class=pill style='background:#fff0d6;color:#9c5700'>Bulk Charge &bull; CVL "
+                    + String(a.cvl_raw / 10.0, 1) + " V</span>";
+        }
+        h += "<p class=b id=lv_main>" + String(a.soc) + "% &nbsp; " + String(a.packV, 2) + " V &nbsp; "
+             + String(a.current, 1) + " A &nbsp; " + badge + "</p>";
         String cclTxt = String(a.ccl_raw / 10.0, 1) + " A";
         if (a.fullStop && nomCcl > 0) {
-            cclTxt += " <span style='color:#666;font-size:12px'>(full stop &bull; max " + String(nomCcl / 10.0, 1) + " A)</span>";
+            cclTxt += " <span style='color:#666;font-size:12px'>(parked &bull; max " + String(nomCcl / 10.0, 1) + " A)</span>";
+        } else if (a.floatMode && nomCcl > a.ccl_raw) {
+            cclTxt += " <span style='color:#666;font-size:12px'>(float limit &bull; max " + String(nomCcl / 10.0, 1) + " A)</span>";
         } else if (nomCcl > a.ccl_raw) {
             cclTxt += " <span style='color:#666;font-size:12px'>(tapered &bull; max " + String(nomCcl / 10.0, 1) + " A)</span>";
         }
@@ -992,48 +1149,85 @@ static String htmlPage() {
         if (nomDcl > a.dcl_raw) {
             dclTxt += " <span style='color:#666;font-size:12px'>(tapered &bull; max " + String(nomDcl / 10.0, 1) + " A)</span>";
         }
-        h += "<p id=lv_sub>SOH " + String(a.soh) + "% (min " + String(a.sohMin ? a.sohMin : a.soh) + "%) &nbsp; "
-             + String(tavgVal, 1) + " C (" + String(a.tmin) + ".." + String(a.tmax)
-             + " C)<br>CCL " + cclTxt + " &nbsp; DCL " + dclTxt + "</p>";
+        h += "<p id=lv_sub style='margin:4px 0 10px;line-height:1.5'>SOH " + String(a.soh) + "% (min " + String(a.sohMin ? a.sohMin : a.soh) + "%) &nbsp; "
+             + String(tavgVal, 1) + " &deg;C (" + String(a.tmin) + ".." + String(a.tmax) + " &deg;C) &nbsp; "
+             + "Cells " + String(a.nCells >= 2 ? a.cells[1] : 0) + ".." + String(a.nCells ? a.cells[0] : 0) + " mV (&Delta;"
+             + String(a.maxSpread == 0xFFFF ? 0 : a.maxSpread) + " mV)<br>"
+             + "Cycles: <b>" + String(a.efcCyclesAvg) + " avg / " + String(a.efcCycles) + " max</b> (Ah eq.) &bull; "
+             + "<span style='color:#666'>" + String(a.rawCyclesAvg) + " avg / " + String(a.rawCycles) + " max (BMS events)</span><br>"
+             + "CVL " + String(a.cvl_raw / 10.0, 1) + " V &nbsp; CCL " + cclTxt + " &nbsp; DCL " + dclTxt + "</p>";
     } else h += "<p class=b id=lv_main>--</p><p id=lv_sub>reading packs...</p>";
-    h += F("<table><thead><tr><th>Pack</th><th>Serial</th><th>SOC</th><th>V</th><th>A</th><th>SOH</th><th>Temp</th><th>CCL / DCL</th></tr></thead><tbody id=lv_tb>");
+    h += F("<table><thead><tr><th>Pack</th><th>Serial</th><th>SOC</th><th>V</th><th>A</th><th>SOH</th><th>Temp</th><th>Cycles (Ah / Evt)</th><th>CCL / DCL</th></tr></thead><tbody id=lv_tb>");
     for (unsigned i = 0; i < NUM_PACKS; i++) {
         Pack &p = local[i];
         bool ok = p.s.valid && now - p.s.ts < STALE_MS;
         h += "<tr><td>" + String(p.addr) + "</td><td>" + String(p.serial) + "</td>";
         if (ok) {
             uint16_t pc = 0, pd = 0, nc = 0, nd = 0;
-            packEffectiveDa(p.s, a.fullStop, pc, pd, nc, nd);
+            packEffectiveDa(p.s, a, pc, pd, nc, nd);
+            uint32_t cap = p.s.capAh ? p.s.capAh : 100;
+            uint16_t efc = p.s.efcCycles ? p.s.efcCycles : (uint16_t)((p.s.ahTotal + cap / 2) / cap);
+            uint16_t raw = p.s.rawCycles ? p.s.rawCycles : p.s.cycles;
             h += "<td>" + String(p.s.soc) + "%</td><td>" + String(p.s.packV, 2) + "</td><td>"
                  + String(p.s.current, 2) + "</td><td>" + String(p.s.soh) + "%</td><td>"
                  + String(p.s.tmin) + ".." + String(p.s.tmax) + "</td><td>"
+                 + String(efc) + " <span style='color:#888'>/ " + String(raw) + "</span></td><td>"
                  + String(pc / 10.0f, 0) + " / " + String(pd / 10.0f, 0) + " A</td>";
-        } else h += "<td colspan=6 style='color:#999'>--</td>";
+        } else h += "<td colspan=7 style='color:#999'>--</td>";
         h += "</tr>";
     }
     h += F("</tbody></table></div>"
+           "<div style='margin:8px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap'>"
+           "<form method=POST action=/rebulk style='margin:0'><button name=act value=bulk>Force Rebulk (Top-Balance Now)</button></form>"
+           "<form method=POST action=/rebulk style='margin:0'><button name=act value=park>Park / EOC Now</button></form>"
+           "<span style='color:#777;font-size:12px' id=lv_eoc>%EOCINFO%</span>"
+           "</div>"
            "<script>"
            "setInterval(async()=>{"
-           "try{const r=await fetch('/status',{cache:'no-store'});const j=await r.json();const a=j.agg;"
+           "try{const r=await fetch('/status',{cache:'no-store'});const j=await r.json();const a=j.agg;const c=j.chg;"
            "if(!a||!a.valid)return;"
            "let nomC=0,nomD=0,tb='';"
            "for(const p of j.packs){"
            "tb+='<tr><td>'+p.addr+'</td><td>'+p.sn+'</td>';"
            "if(p.ok){nomC+=p.nom_ccl;nomD+=p.nom_dcl;"
-           "tb+='<td>'+p.soc+'%</td><td>'+p.v.toFixed(2)+'</td><td>'+p.i.toFixed(2)+'</td><td>'+p.soh+'%</td><td>'+p.tmin+'..'+p.tmax+'</td><td>'+p.ccl.toFixed(0)+' / '+p.dcl.toFixed(0)+' A</td>';}"
-           "else tb+=\"<td colspan=6 style='color:#999'>--</td>\";"
+           "tb+='<td>'+p.soc+'%</td><td>'+p.v.toFixed(2)+'</td><td>'+p.i.toFixed(2)+'</td><td>'+p.soh+'%</td><td>'+p.tmin+'..'+p.tmax+'</td><td>'+p.efc+' <span style=\"color:#888\">/ '+p.cyc+'</span></td><td>'+p.ccl.toFixed(0)+' / '+p.dcl.toFixed(0)+' A</td>';}"
+           "else tb+=\"<td colspan=7 style='color:#999'>--</td>\";"
            "tb+='</tr>';}"
            "document.getElementById('lv_tb').innerHTML=tb;"
-           "const m=document.getElementById('lv_main');if(m)m.innerHTML=a.soc+'% &nbsp; '+a.v.toFixed(1)+' V &nbsp; '+a.i.toFixed(1)+' A';"
+           "let bg='';"
+           "if(j.deye&&j.deye.fullStop)bg=\"<span class=pill style='background:#dff6e4;color:#0f6a28'>UPS EOC Stop &bull; Rebulk &le; \"+(c?c.rebulk_soc:96)+\"%</span>\";"
+           "else if(a.float_mode)bg=\"<span class=pill style='background:#e0f0ff;color:#0b5394'>Follow-Float &bull; CVL \"+a.cvl.toFixed(1)+\" V (target \"+(c?c.float_target_v.toFixed(1):'50.1')+\" V)</span>\";"
+           "else bg=\"<span class=pill style='background:#fff0d6;color:#9c5700'>Bulk Charge &bull; CVL \"+a.cvl.toFixed(1)+\" V</span>\";"
+           "const m=document.getElementById('lv_main');if(m)m.innerHTML=a.soc+'% &nbsp; '+a.v.toFixed(2)+' V &nbsp; '+a.i.toFixed(1)+' A &nbsp; '+bg;"
            "let ct=a.ccl.toFixed(1)+' A';"
-           "if(j.deye&&j.deye.fullStop&&nomC>0)ct+=\" <span style='color:#666;font-size:12px'>(full stop &bull; max \"+nomC.toFixed(1)+\" A)</span>\";"
+           "if(j.deye&&j.deye.fullStop&&nomC>0)ct+=\" <span style='color:#666;font-size:12px'>(parked &bull; max \"+nomC.toFixed(1)+\" A)</span>\";"
+           "else if(a.float_mode&&nomC>a.ccl+0.2)ct+=\" <span style='color:#666;font-size:12px'>(float limit &bull; max \"+nomC.toFixed(1)+\" A)</span>\";"
            "else if(nomC>a.ccl+0.2)ct+=\" <span style='color:#666;font-size:12px'>(tapered &bull; max \"+nomC.toFixed(1)+\" A)</span>\";"
            "let dt=a.dcl.toFixed(1)+' A';"
            "if(nomD>a.dcl+0.2)dt+=\" <span style='color:#666;font-size:12px'>(tapered &bull; max \"+nomD.toFixed(1)+\" A)</span>\";"
-           "const s=document.getElementById('lv_sub');if(s)s.innerHTML='SOH '+a.soh+'% (min '+a.soh_min+'%) &nbsp; '+a.tavg.toFixed(1)+' C ('+a.tmin+'..'+a.tmax+' C)<br>CCL '+ct+' &nbsp; DCL '+dt;"
+           "const s=document.getElementById('lv_sub');if(s)s.innerHTML='SOH '+a.soh+'% (min '+a.soh_min+'%) &nbsp; '+a.tavg.toFixed(1)+' &deg;C ('+a.tmin+'..'+a.tmax+' &deg;C) &nbsp; Cells '+a.cellmin+'..'+a.cellmax+' mV (&Delta;'+a.spread_max+' mV)<br>'"
+           "+'Cycles: <b>'+a.efc_avg+' avg / '+a.efc_max+' max</b> (Ah eq.) &bull; <span style=\"color:#666\">'+a.raw_cyc_avg+' avg / '+a.raw_cyc_max+' max (BMS events)</span><br>'"
+           "+'CVL '+a.cvl.toFixed(1)+' V &nbsp; CCL '+ct+' &nbsp; DCL '+dt;"
+           "if(c&&c.last_eoc_str){const el=document.getElementById('lv_eoc');if(el)el.textContent='Last full top-balance: '+c.last_eoc_str;}"
            "}catch(e){}},3000);"
            "</script>"
            "<form method=POST action=/save>"
+           "<fieldset><legend>Charge &amp; BMS Control (NVS Persistent)</legend>"
+           "<span class=lbl>Charge Mode</span><select name=cmode>"
+           "<option value=0 %CM0%>UPS Stop Mode (CCL = 0 A when full until Rebulk SOC &mdash; Grid/UPS)</option>"
+           "<option value=1 %CM1%>Solar Follow-Float CVL (Step CVL to Float V, keep CCL open &mdash; Solar PV)</option>"
+           "</select><br>"
+           "<span class=lbl>Rebulk SOC</span><input name=rbsoc type=number min=70 max=99 value='%RBSOC%' style='width:58px'> % "
+           "<span style='color:#777;font-size:12px'>(start new Bulk cycle at &le; this SOC, or single pack &le; SOC&minus;2%)</span><br>"
+           "<span class=lbl>Float CVL</span><input name=fltv type=number step=0.1 min=49.0 max=53.5 value='%FLTV%' style='width:68px'> V "
+           "<span style='color:#777;font-size:12px'>(Solar Follow-Float target, e.g. 50.1 V = 3.34 V/cell for 15S)</span><br>"
+           "<span class=lbl>Periodic Rebulk</span><input name=rbdays type=number min=0 max=60 value='%RBDAYS%' style='width:58px'> days "
+           "<span style='color:#777;font-size:12px'>(top-balance interval if parked continuously; 0 = disabled)</span><br>"
+           "<span class=lbl>Deye Cycles</span><select name=ahcyc>"
+           "<option value=1 %AH1%>True Ah-Equivalent Cycles (ahTotal / 100 Ah &mdash; Recommended)</option>"
+           "<option value=0 %AH0%>Huawei Raw Event Counter (0x0042)</option>"
+           "</select>"
+           "</fieldset>"
            "<fieldset><legend>WiFi (NVS Persistent)</legend>"
            "<span class=lbl>SSID</span><input name=wssid value='%WSSID%' size=28 maxlength=32><br>"
            "<span class=lbl>Password</span><input name=wpass type=password placeholder='%WPPH%' size=28 maxlength=64 autocomplete=new-password><br>"
@@ -1059,10 +1253,27 @@ static String htmlPage() {
            "<fieldset><legend>Firmware</legend>"
            "<form method=POST action=/update enctype='multipart/form-data'>"
            "<input type=file name=fw accept=.bin> <button>Upload &amp; reboot</button></form>"
-           "<p style='color:#999;font-size:12px'>OTA &amp; USB firmware uploads keep NVS WiFi/MQTT settings intact. Also available via espota (port 3232).</p></fieldset>");
+           "<p style='color:#999;font-size:12px'>OTA &amp; USB firmware uploads keep NVS WiFi/MQTT/Charge settings intact. Also available via espota (port 3232).</p></fieldset>");
     char nowStr[26] = "not synced yet";
     uint32_t ep = epochNow();
     if (ep) { time_t tt = ep; struct tm lt; localtime_r(&tt, &lt); strftime(nowStr, sizeof(nowStr), "%Y-%m-%d %H:%M:%S", &lt); }
+    String eocInfo;
+    if (cfg.lastEocEpoch > 0) {
+        char eb[24]; time_t et = cfg.lastEocEpoch; struct tm elt; localtime_r(&et, &elt);
+        strftime(eb, sizeof(eb), "%Y-%m-%d %H:%M", &elt);
+        eocInfo = "Last full top-balance: " + String(eb);
+        if (ep > cfg.lastEocEpoch) eocInfo += " (" + String((ep - cfg.lastEocEpoch) / 86400.0f, 1) + " d ago)";
+    } else {
+        eocInfo = "Last full top-balance: waiting for NTP / EOC";
+    }
+    h.replace("%EOCINFO%", eocInfo);
+    h.replace("%CM0%", cfg.chgMode == CHG_MODE_UPS_STOP ? "selected" : "");
+    h.replace("%CM1%", cfg.chgMode == CHG_MODE_SOLAR_FLOAT ? "selected" : "");
+    h.replace("%RBSOC%", String(cfg.rebulkSoc));
+    h.replace("%FLTV%", String(cfg.floatVoltDv / 10.0f, 1));
+    h.replace("%RBDAYS%", String(cfg.rebulkDays));
+    h.replace("%AH1%", cfg.ahCycles ? "selected" : "");
+    h.replace("%AH0%", !cfg.ahCycles ? "selected" : "");
     h.replace("%EN%", cfg.mqttEnable ? "checked" : "");
     h.replace("%HOST%", htmlEsc(cfg.host)); h.replace("%PORT%", String(cfg.port));
     h.replace("%USER%", htmlEsc(cfg.user));
@@ -1082,7 +1293,55 @@ static String htmlPage() {
     return h;
 }
 
+static void handleRebulk() {
+    String act = web.arg("act");
+    if (xSemaphoreTake(mux, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (act == "park") {
+            if (agg.valid && agg.soc >= 90) {
+                chgSt.eocLatched     = true;
+                chgSt.forceBulk      = false;
+                chgSt.bulkHoldUntilS = 0;
+                uint16_t ceilDv      = (uint16_t)ceilf(agg.packV * 10.0f);
+                chgSt.activeFloatDv  = max<uint16_t>(cfg.floatVoltDv, ceilDv);
+            }
+        } else {
+            chgSt.forceBulk = true;
+        }
+        aggregate();
+        xSemaphoreGive(mux);
+    }
+    web.sendHeader("Location", "/");
+    web.send(303);
+}
+
 static void handleSave() {
+    if (web.hasArg("cmode")) {
+        int cm = web.arg("cmode").toInt();
+        cfg.chgMode = (cm == 1) ? CHG_MODE_SOLAR_FLOAT : CHG_MODE_UPS_STOP;
+    }
+    if (web.hasArg("rbsoc")) {
+        int rb = web.arg("rbsoc").toInt();
+        if (rb < 70) rb = 70;
+        if (rb > 99) rb = 99;
+        cfg.rebulkSoc = (uint8_t)rb;
+    }
+    if (web.hasArg("fltv")) {
+        float fv = web.arg("fltv").toFloat();
+        int fdv = (int)lroundf(fv * 10.0f);
+        if (fdv < 490) fdv = 490;
+        if (fdv > 535) fdv = 535;
+        cfg.floatVoltDv = (uint16_t)fdv;
+    }
+    if (web.hasArg("rbdays")) {
+        int rd = web.arg("rbdays").toInt();
+        if (rd < 0)  rd = 0;
+        if (rd > 60) rd = 60;
+        cfg.rebulkDays = (uint8_t)rd;
+    }
+    if (web.hasArg("ahcyc")) {
+        cfg.ahCycles = (web.arg("ahcyc").toInt() != 0);
+    }
+
     cfg.mqttEnable = web.hasArg("en");
     web.arg("host").toCharArray(cfg.host, sizeof(cfg.host));
     cfg.port = web.arg("port").toInt() ?: 1883;
@@ -1128,6 +1387,10 @@ static void handleSave() {
     }
 
     saveCfg();
+    if (xSemaphoreTake(mux, pdMS_TO_TICKS(50)) == pdTRUE) {
+        aggregate();
+        xSemaphoreGive(mux);
+    }
     if (!apMode) applyNtp();             // re-sync with the new servers and TZ immediately
     if (mqtt.connected()) mqtt.disconnect();
     if (wifiChanged) {
@@ -1144,15 +1407,28 @@ static void handleSave() {
 // HTML page does not show), the Deye poll counters, and the raw limit registers
 // of each pack. This lets you check the 0x100A block remotely. curl http://<ip>/status
 static void handleStatus() {
-    PackSnapshot a; Pack local[NUM_PACKS];
+    PackSnapshot a; Pack local[NUM_PACKS]; ChargeCtrlState cs;
     if (xSemaphoreTake(mux, pdMS_TO_TICKS(50)) == pdTRUE) {
-        a = agg; for (unsigned i = 0; i < NUM_PACKS; i++) local[i] = pk[i]; xSemaphoreGive(mux);
+        a = agg; cs = chgSt;
+        for (unsigned i = 0; i < NUM_PACKS; i++) local[i] = pk[i];
+        xSemaphoreGive(mux);
     }
     uint32_t now = millis();
     uint32_t dPoll = deye.lastPollMs ? (now - deye.lastPollMs) : 0xFFFFFFFF;
     uint32_t ep = epochNow();
     char localStr[26] = "";
     if (ep) { time_t tt = ep; struct tm lt; localtime_r(&tt, &lt); strftime(localStr, sizeof(localStr), "%Y-%m-%d %H:%M:%S", &lt); }
+    String eocStr;
+    float daysSinceEoc = -1.0f;
+    if (cfg.lastEocEpoch > 0) {
+        char eb[24]; time_t et = cfg.lastEocEpoch; struct tm elt; localtime_r(&et, &elt);
+        strftime(eb, sizeof(eb), "%Y-%m-%d %H:%M", &elt);
+        eocStr = String(eb);
+        if (ep > cfg.lastEocEpoch) {
+            daysSinceEoc = (ep - cfg.lastEocEpoch) / 86400.0f;
+            eocStr += " (" + String(daysSinceEoc, 1) + " d ago)";
+        }
+    }
     String j = "{\"fw\":\"" FW_VERSION "\",\"up\":" + String(now / 1000);
     j += ",\"net\":{\"ap\":" + String(apMode ? 1 : 0) +
          ",\"ssid\":\"" + jsonEsc(apMode ? AP_SSID : WiFi.SSID().c_str()) +
@@ -1163,6 +1439,18 @@ static void handleStatus() {
     j += ",\"time\":{\"epoch\":" + String(ep) + ",\"synced\":" + String(ep ? 1 : 0) +
          ",\"local\":\"" + String(localStr) + "\",\"tz\":\"" + String(cfg.tz) +
          "\",\"posix\":\"" + String(tzToPosix(cfg.tz)) + "\",\"ntp\":\"" + String(cfg.ntp1) + "\"}";
+    j += ",\"chg\":{\"mode\":" + String(cfg.chgMode) +
+         ",\"mode_name\":\"" + String(cfg.chgMode == CHG_MODE_SOLAR_FLOAT ? "solar_float" : "ups_stop") +
+         "\",\"state\":\"" + String(chargeStateName(a)) +
+         "\",\"eoc_latched\":" + String(cs.eocLatched ? 1 : 0) +
+         ",\"rebulk_soc\":" + String(cfg.rebulkSoc) +
+         ",\"rebulk_days\":" + String(cfg.rebulkDays) +
+         ",\"float_target_v\":" + String(cfg.floatVoltDv / 10.0f, 1) +
+         ",\"float_active_v\":" + String(cs.activeFloatDv / 10.0f, 1) +
+         ",\"ah_cycles\":" + String(cfg.ahCycles ? 1 : 0) +
+         ",\"last_eoc_epoch\":" + String(cfg.lastEocEpoch) +
+         ",\"days_since_eoc\":" + String(daysSinceEoc, 2) +
+         ",\"last_eoc_str\":\"" + jsonEsc(eocStr.c_str()) + "\"}";
     float tavgVal = !isnan(a.tavg) ? a.tavg : ((a.tmin + a.tmax) * 0.5f);
     j += ",\"agg\":{\"valid\":" + String(a.valid ? 1 : 0) +
          ",\"soc\":" + String(a.soc) + ",\"v\":" + String(a.packV, 2) +
@@ -1171,7 +1459,10 @@ static void handleStatus() {
          ",\"soh\":" + String(a.soh) + ",\"soh_min\":" + String(a.sohMin ? a.sohMin : a.soh) +
          ",\"tavg\":" + String(tavgVal, 2) +
          ",\"tmin\":" + String(a.tmin) + ",\"tmax\":" + String(a.tmax) +
-         ",\"cyc_avg\":" + String(a.cyclesAvg ? a.cyclesAvg : a.cycles) + ",\"cyc_max\":" + String(a.cycles) +
+         ",\"cyc_avg\":" + String(a.cyclesAvg) + ",\"cyc_max\":" + String(a.cycles) +
+         ",\"efc_avg\":" + String(a.efcCyclesAvg) + ",\"efc_max\":" + String(a.efcCycles) +
+         ",\"raw_cyc_avg\":" + String(a.rawCyclesAvg) + ",\"raw_cyc_max\":" + String(a.rawCycles) +
+         ",\"float_mode\":" + String(a.floatMode ? 1 : 0) +
          ",\"cellmax\":" + String(a.nCells ? a.cells[0] : 0) +
          ",\"cellmin\":" + String(a.nCells >= 2 ? a.cells[1] : 0) +
          ",\"spread_max\":" + String(a.maxSpread == 0xFFFF ? 0 : a.maxSpread) +
@@ -1181,6 +1472,7 @@ static void handleStatus() {
     j += ",\"deye\":{\"answered\":" + String(deye.answered) +
          ",\"badFrames\":" + String(deye.badFrames) +
          ",\"fullStop\":" + String(a.fullStop ? 1 : 0) +
+         ",\"floatMode\":" + String(a.floatMode ? 1 : 0) +
          ",\"pollAge\":" + String((int32_t)(dPoll == 0xFFFFFFFF ? -1 : (int32_t)dPoll)) +
          ",\"cid\":\"" + String(deye.lastCid2) + "\"}";
     j += ",\"packs\":[";
@@ -1192,17 +1484,20 @@ static void handleStatus() {
         String cells = "["; for (uint8_t c = 0; c < p.s.nCells; c++) { if (c) cells += ","; cells += String(p.s.cells[c]); } cells += "]";
         String temps = "["; for (uint8_t c = 0; c < p.s.nTemps; c++) { if (c) temps += ","; temps += String(p.s.ctemps[c]); } temps += "]";
         uint16_t pCclDa = 0, pDclDa = 0, pNomC = 0, pNomD = 0;
-        packEffectiveDa(p.s, a.fullStop, pCclDa, pDclDa, pNomC, pNomD);
+        packEffectiveDa(p.s, a, pCclDa, pDclDa, pNomC, pNomD);
+        uint32_t cap = p.s.capAh ? p.s.capAh : 100;
+        uint16_t efc = p.s.efcCycles ? p.s.efcCycles : (uint16_t)((p.s.ahTotal + cap / 2) / cap);
+        uint16_t raw = p.s.rawCycles ? p.s.rawCycles : p.s.cycles;
         if (i) j += ",";
         j += "{\"addr\":" + String(p.addr) + ",\"sn\":\"" + String(p.serial) +
              "\",\"ok\":" + String(ok ? 1 : 0) + ",\"age\":" + String(p.s.valid ? (int32_t)(now - p.s.ts) : -1) +
-             ",\"cap_ah\":" + String(p.s.capAh ? p.s.capAh : 100) +
+             ",\"cap_ah\":" + String(cap) +
              ",\"soc\":" + String(p.s.soc) + ",\"v\":" + String(p.s.packV, 2) +
              ",\"busv\":" + String(p.s.busV, 2) +
              ",\"i\":" + String(p.s.current, 2) + ",\"soh\":" + String(p.s.soh) +
              ",\"tmin\":" + String(p.s.tmin) + ",\"tmax\":" + String(p.s.tmax) +
              ",\"cellmax\":" + String(hi) + ",\"cellmin\":" + String(lo == 0xFFFF ? 0 : lo) +
-             ",\"cyc\":" + String(p.s.cycles) + ",\"ah\":" + String(p.s.ahTotal) +
+             ",\"cyc\":" + String(raw) + ",\"efc\":" + String(efc) + ",\"ah\":" + String(p.s.ahTotal) +
              ",\"ccl\":" + String(pCclDa / 10.0, 1) + ",\"dcl\":" + String(pDclDa / 10.0, 1) +
              ",\"nom_ccl\":" + String(pNomC / 10.0, 1) + ",\"nom_dcl\":" + String(pNomD / 10.0, 1) +
              ",\"ccl_raw\":" + String(p.s.ccl_raw) + ",\"ccl_coef\":" + String(p.s.ccl_coef) +
@@ -1344,6 +1639,7 @@ void setup() {
         web.send(200, "text/html; charset=utf-8", htmlPage());
     });
     web.on("/save", HTTP_POST, handleSave);
+    web.on("/rebulk", HTTP_POST, handleRebulk);
     web.on("/status", handleStatus);
     web.on("/audit", HTTP_GET, handleAudit);
     // captive portal: send any other URL to the config page (setup-AP use)
@@ -1354,6 +1650,7 @@ void setup() {
 
 void loop() {
     static uint32_t lastWifi = 0, lastMqtt = 0, lastPub = 0, lastDisp = 0, lastStat = 0;
+    static uint32_t lastSavedEocEpoch = 0;
     static bool wasConnected = false;
     uint32_t now = millis();
 
@@ -1361,6 +1658,19 @@ void loop() {
     web.handleClient();
     if (apMode) dnsServer.processNextRequest();
     if (mqtt.connected()) mqtt.loop();
+
+    if (pendingSaveEocTs) {
+        pendingSaveEocTs = false;
+        uint32_t eocEp = 0;
+        if (xSemaphoreTake(mux, pdMS_TO_TICKS(20)) == pdTRUE) { eocEp = cfg.lastEocEpoch; xSemaphoreGive(mux); }
+        if (eocEp > 0 && (lastSavedEocEpoch == 0 || eocEp - lastSavedEocEpoch >= 3600)) {
+            if (prefs.begin("bank", false)) {
+                prefs.putULong("eocts", eocEp);
+                prefs.end();
+                lastSavedEocEpoch = eocEp;
+            }
+        }
+    }
 
     if (apMode) {
         // If we fell back to AP+STA because the home router was still booting
@@ -1421,6 +1731,7 @@ void loop() {
         ip = WiFi.isConnected() ? WiFi.localIP().toString()
            : (apMode ? ("AP " + WiFi.softAPIP().toString()) : String("WiFi..."));
         v.ip = ip.c_str();
+        v.chgTag = a.valid ? (a.fullStop ? "STOP" : (a.floatMode ? "FLT" : "BULK")) : "";
         v.mqttOn = cfg.mqttEnable; v.mqttOk = mqtt.connected();
         v.deyeAgeMs = deye.lastPollMs ? (now - deye.lastPollMs) : UINT32_MAX;
         displayBank(v);
