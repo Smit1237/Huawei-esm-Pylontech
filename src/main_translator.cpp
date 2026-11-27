@@ -216,9 +216,11 @@ static void esmTask(void *) {
             uint16_t minCell = 0xFFFF;
             for (uint8_t i = 0; i < local.nCells; i++)
                 if (local.cells[i] < minCell) minCell = local.cells[i];
+            bool cellFloorTrip = (minCell != 0xFFFF) &&
+                                 ((fabsf(local.current) <= 1.0f && minCell < 3260) || minCell < 3150);
             if (local.soc == 100 && fabsf(local.current) <= 0.5f && (minCell == 0xFFFF || minCell >= 3310))
                 local.fullStop = true;
-            else if (local.soc <= 96 || local.current < -1.0f || (minCell != 0xFFFF && minCell < 3280))
+            else if (local.soc <= 96 || cellFloorTrip)
                 local.fullStop = false;
 
             local.valid = true;

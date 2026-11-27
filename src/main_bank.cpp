@@ -61,7 +61,7 @@
 // Increase this on each build. Then you can confirm the live image in the
 // WebUI header and the serial banner. This proves that an OTA push worked.
 #ifndef FW_VERSION
-#define FW_VERSION "bank-2.3-exp"
+#define FW_VERSION "bank-2.4-exp"
 #endif
 #ifndef ESM_TX_PIN
 #define ESM_TX_PIN 33
@@ -641,16 +641,18 @@ static void aggregate() {
             bankMinT = min<int16_t>(bankMinT, bankMinSensorT);
         }
 
-        // Clean full-charge hysteresis latch:
+        // Clean full-charge hysteresis latch (96%..100% SOC window):
         //   * Engage when every active pack is 100% SOC, current has settled near 0, and
         //     cells >= 3310 mV (includes rested 100% OCV so reboots never trigger a pulse).
-        //   * Release ONLY on real discharge (sumI < -1.0 A), meaningful SOC drop
-        //     (avgSoc <= 96% or any pack <= 94%), or safety cell floor (< 3280 mV) —
-        //     never on normal LiFePO4 surface-charge relaxation (3.31..3.35 V/cell).
+        //   * Release ONLY on meaningful SOC drop (avgSoc <= 96% or any pack <= 94%) or
+        //     genuine low-cell safety floor (< 3260 mV at rest, or < 3150 mV under load).
+        //     Brief grid brownouts (< 3..4% DOD) keep CCL = 0 A (while DCL stays 400 A)
+        //     so short outages do not trigger post-outage top-ups or pile up cycle counts.
+        bool cellFloorTrip = (bankMinCell != 0xFFFF) &&
+                             ((fabsf(sumI) <= 1.0f && bankMinCell < 3260) || bankMinCell < 3150);
         if (allFull && fabsf(sumI) <= 0.5f && (bankMinCell == 0xFFFF || bankMinCell >= 3310)) {
             bankFullLatched = true;
-        } else if (avgSoc <= 96 || minPackSoc <= 94 || sumI < -1.0f ||
-                   (bankMinCell != 0xFFFF && bankMinCell < 3280)) {
+        } else if (avgSoc <= 96 || minPackSoc <= 94 || cellFloorTrip) {
             bankFullLatched = false;
         }
         if (bankFullLatched) sumCcl = 0;
